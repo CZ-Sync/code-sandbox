@@ -1,6 +1,4 @@
-# This script processes streamflow data from USGS and Canadian gages to calculate various
-# hydrological signatures and trends. It analyzes flow volumes, flow duration curves,
-# flashiness, and flow timing.
+# This script processes streamflow data from USGS and Canadian gages to calculate various hydrological signatures and trends. It analyzes flow volumes, flow duration curves, flashiness, and flow timing.
 
 
 # Streamflow Signatures
@@ -11,8 +9,9 @@ Modular functions allow for the calculation of a variety of streamflow signature
 
 Additionally, the script leverages the HydroSHEDS to identify all watersheds upstream each gage, which allows for a quick identification of various watershed hydro-, socio-, geophysical features.
 
-Note that this workflow leverages several datasets that are not included in the github repo. Please contact Arik Tashie (arik@climate.ai) for these datasets, if you do not already have them readily available 
+Note that this workflow leverages several datasets that are not included in the github repo. All files (in the expected structure) are located here: https://drive.google.com/drive/folders/1N7wAXsQRexsNQi7h4tlwCf6um2VNUFLo.
 
+Please contact Arik Tashie (arik@climate.ai) if you have any questions.
 
 ## Contributing
 
