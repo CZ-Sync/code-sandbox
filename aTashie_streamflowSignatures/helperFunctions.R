@@ -877,6 +877,10 @@ calculate_median_flow_dates <- function(streamflow_data) {
 
 
 
+############################################################
+# not yet implemented
+
+
 get_era5land_for_basins <- function(basin_ids, basin_polygons, 
                                     start_year = 1980, end_year = 2021,
                                     variables = c("2m_temperature", "total_precipitation"),
