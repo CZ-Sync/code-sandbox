@@ -3,7 +3,11 @@
 
 # Streamflow Signatures
 
-A simple script for automating the ingestion and processing of publicly available streamflow data in the US and Canada.
+A simple script for automating the ingestion and processing streamflow and climate data
+
+streamflowDataProcessing_USGS-and-Hydat.R links to real time and historical USGS and Hydat databases in the US and Canada.
+
+streamflowDataProcessing_Caravan.R links to a static database of Caravan (incl. Camels, Lamah, and Hysets) streamflow and climate data.
 
 Modular functions allow for the calculation of a variety of streamflow signatures, analysis of trends in these signatures, and saving a summary of the analysis locally.
 
