@@ -6,7 +6,7 @@ Use this repository to put one-off or example code scripts in order to share wit
 
 Hello y'all! Here's a joke
 
-knock knock
+Knock knock
 
 Who's there?
 
