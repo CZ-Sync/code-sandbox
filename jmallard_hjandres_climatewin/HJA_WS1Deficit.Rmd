@@ -1,0 +1,213 @@
+---
+title: "HJA_Deficit"
+output: html_notebook
+---
+
+Using WS1 and WS2 data to calculate flow deficits in WS1
+
+```{r Packages}
+library(tidyverse)
+library(lubridate)
+library(broom)
+library(zoo)
+```
+
+Regression calibrations based on monthly data
+```{r MonthRegression}
+CalStartWY = 1953
+CalEndWY = 1962
+
+CalData <- allData %>% 
+  select(DATE, WY, WS1, WS2) %>% 
+  arrange(DATE) %>% 
+  filter(between(WY, CalStartWY, CalEndWY)) %>% 
+  mutate(Month = month(DATE),
+         Year = year(DATE)) %>%
+  group_by(Year, Month) %>%
+  summarise(WS1 = sum(WS1),
+            WS2 = sum(WS2)) %>%
+  ungroup()
+
+CalReg <- CalData %>% 
+  select(Month, WS1, WS2) %>% 
+  nest(Data = -Month) %>% 
+  mutate(Fit = map(Data, ~ lm(WS1 ~ WS2, data = .x))) %>% 
+  mutate(RegPar = map(Fit, tidy)) %>% 
+  unnest(RegPar) %>% 
+  mutate(term = case_when(term == "(Intercept)" ~ "Int",
+                          TRUE ~ "Slp")) %>% 
+  select(Month, term, estimate) %>% 
+  spread(term, estimate)
+
+# #Checking that above code generated the correct regressions
+# Test <- CalData %>%
+#   select(Month, WS1, WS2) %>%
+#   filter(Month == 5) %>%
+#   lm(WS1 ~ WS2, data = .)
+```
+
+Select two time periods and compare observed to monthly mean deficit/surplus using regression coefficients calculated above
+```{r PostVsPresent}
+PostStartWY = 1967
+PostEndWY = 1971
+PresStartWY = 2015
+PresEndWY = 2019
+
+DefCompare <- allData %>% 
+  select(DATE, WY, WS1, WS2) %>% 
+  arrange(DATE) %>% 
+  filter(between(WY, PostStartWY, PostEndWY) |
+           between(WY, PresStartWY, PresEndWY)) %>% 
+  mutate(Month = month(DATE),
+         Year = year(DATE)) %>%
+  group_by(Year, Month) %>% 
+  summarise(WS1 = sum(WS1),
+            WS2 = sum(WS2)) %>% 
+  ungroup() %>% 
+  mutate(Period = case_when(Year < 1980 ~ "Post",
+                            Year > 1980 ~ "Pres")) %>% 
+  merge(CalReg, by = "Month") %>% 
+  mutate(WS1pred = WS2 * Slp + Int) %>% #Calculate predicted WS1 w/out treatment
+  mutate(WS1def = WS1 - WS1pred) %>% #Calculate surplus or deficit
+  arrange(Year, Month)
+  
+DefMonWS1 <- DefCompare %>% 
+  select(Month, Period, WS1def) %>% 
+  group_by(Period, Month) %>% 
+  summarise(WS1def = mean(WS1def)) %>% 
+  mutate(WYMonth = case_when(Month >= 10 ~ Month - 9,
+                             Month < 10 ~ Month + 3)) %>% 
+  arrange(Period, WYMonth) %>% 
+  mutate(Month = factor(month.abb[Month], levels = c(month.abb[10:12], month.abb[1:9])))
+
+DefMonWS1Plot <- DefMonWS1 %>% 
+  ggplot(aes(x = Month, y = WS1def, fill = Period)) +
+  geom_bar(position = "dodge", stat = "identity")
+print(DefMonWS1Plot)
+
+save(DefMonWS1, file = "ManuscriptDocuments/Figures/FigureData/WS1_Month_Deficit.RData")
+```
+Calculate growing season deficit for current period. Using "DefCompare" from above
+```{r GrowingSeasonDeficit}
+GrowStart = 5 #Months of start and end of growing season
+GrowEnd = 8 
+
+GrowDef <- DefCompare %>% 
+  filter(Period == "Pres") %>% 
+  select(Month, WS1def) %>% 
+  filter(between(Month, GrowStart, GrowEnd)) %>% 
+  group_by(Month) %>% 
+  summarise(meanDef = mean(WS1def))
+
+print(sum(GrowDef$meanDef))
+  
+```
+
+Look at growing season deficit in every 5 yr period from 2000 - 2019
+```{r GSDeficitPost2000}
+StartWY = 2000
+EndWY = 2019
+
+StartGS = 5
+EndGS = 8
+
+DefPost2000 <- allData %>% 
+  select(DATE, WY, WS1, WS2) %>% 
+  arrange(DATE) %>% 
+  filter(between(WY, StartWY, EndWY)) %>% 
+  mutate(Month = month(DATE),
+         Year = year(DATE)) %>%
+  group_by(WY, Month) %>% 
+  summarise(WS1 = sum(WS1),
+            WS2 = sum(WS2)) %>% 
+  ungroup() %>% 
+  merge(CalReg, by = "Month") %>% 
+  mutate(WS1pred = WS2 * Slp + Int) %>% #Calculate predicted WS1 w/out treatment
+  mutate(WS1def = WS1 - WS1pred) #Calculate surplus or deficit
+
+GSDefPost2000 <- DefPost2000 %>% 
+  filter(between(Month, StartGS, EndGS)) %>% 
+  group_by(WY) %>% 
+  summarise(GSDef = sum(WS1def))
+
+GSDefPost2000Plot <- GSDefPost2000 %>% 
+  ggplot(aes(x = WY, y = GSDef)) + 
+  geom_bar(position = "dodge", stat = "identity") +
+  geom_line(size = 2, 
+           data = GSDefPost2000 %>% 
+              mutate(GSDef = rollmean(GSDef, 5, align = "center", fill = NA)),
+            size = 2) +
+  theme_bw() +
+  scale_y_continuous(expand = expand_scale(mult = c(0.05, 0))) +
+  labs(x = "Water Year", y = "May - August Deficit (mm)")
+print(GSDefPost2000Plot)
+```
+Put together deficits for post-logging and four, five-year periods between 2000 and 2019
+```{r Post V Present 2000-2019}
+#Start and end years of post logging and modern period to extract data
+SurStartWY = 1967
+SurEndWY = 1971
+DefStartWY = 2000
+DefEndWY = 2019
+
+#Start and end years of five year periods to calculate differences
+Start5Yr = c(1967, 2000, 2005, 2010, 2015)
+End5Yr = c(1971, 2004, 2009, 2014, 2019)
+
+#Months to focus on for surplus/deficit calculations
+StartGS = 5
+EndGS = 8
+
+#Calculate monthly deficits/surpluses for each of these years
+WS1QChange5Yr <- allData %>% 
+  select(DATE, WY, WS1, WS2) %>% 
+  arrange(DATE) %>% 
+  filter(between(WY, SurStartWY, SurEndWY) | 
+           between(WY, DefStartWY, DefEndWY)) %>% 
+  mutate(Month = month(DATE),
+         Year = year(DATE)) %>%
+  group_by(WY, Month) %>%
+  summarise(WS1 = sum(WS1),
+            WS2 = sum(WS2)) %>%
+  ungroup() %>%
+  mutate(Period = case_when(between(WY, Start5Yr[1], End5Yr[1]) ~ "1967-1971",
+                            between(WY, Start5Yr[2], End5Yr[2]) ~ "2000-2004",
+                            between(WY, Start5Yr[3], End5Yr[3]) ~ "2005-2009",
+                            between(WY, Start5Yr[4], End5Yr[4]) ~ "2010-2014",
+                            between(WY, Start5Yr[5], End5Yr[5]) ~ "2015-2019")) %>% 
+  merge(CalReg, by = "Month") %>%
+  arrange(WY, Month) %>% 
+  mutate(WS1pred = WS2 * Slp + Int) %>% #Calculate predicted WS1 w/out treatment
+  mutate(WS1dif = WS1 - WS1pred) %>% #Calculate surplus or deficit
+  mutate(WS1RelDif = WS1dif/WS1)
+
+#Average by month for each five year period
+WS1QChange5YrMon <- WS1QChange5Yr %>% 
+  select(Period, WY, Month, WS1, WS1pred, WS1dif, WS1RelDif) %>% 
+  group_by(Period, Month) %>% 
+  summarise(WS1 = mean(WS1),
+            WS1pred = mean(WS1pred),
+            WS1dif = mean(WS1dif),
+            WS1RelDif = mean(WS1RelDif)) %>% 
+  mutate(WYMonth = case_when(Month >= 10 ~ Month - 9,
+                             Month < 10 ~ Month + 3)) %>% 
+  arrange(Period, WYMonth) %>% 
+  mutate(Month = factor(month.abb[Month], levels = c(month.abb[10:12], month.abb[1:9])))
+
+save(WS1QChange5YrMon, file = "ManuscriptDocuments/Figures/FigureData/WS1_Month_Deficit.RData")
+
+#Plot as grouped bars  
+WS1QChange5YrMonPlot <- WS1QChange5YrMon %>% 
+  ggplot(aes(x = Month, y = WS1dif, fill = Period)) +
+  geom_bar(position = "dodge", stat = "identity")
+print(WS1QChange5YrMonPlot)
+  
+#Four growing season deficits for post 2000
+WS1QChange5YrGS <- WS1QChange5YrMon %>% 
+  filter(between(WYMonth, 8, 11)) %>% 
+  group_by(Period) %>% 
+  summarize(GSDef = sum(WS1dif),
+            GSQ = sum(WS1)) %>% 
+  mutate(GSRelDef = GSDef/GSQ)
+           
+```

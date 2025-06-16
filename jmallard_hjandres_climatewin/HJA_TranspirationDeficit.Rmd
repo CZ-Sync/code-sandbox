@@ -1,0 +1,688 @@
+---
+title: "HJA_ET_fromMoore2004"
+output:
+  html_document:
+    df_print: paged
+---
+
+Load packages
+```{r LoadPackages}
+library(lubridate)
+library(ggplot2)
+library(zoo)
+library(climwin)
+library(plotly)
+library(imputeTS)
+library(ggpubr)
+library(ggthemes)
+library(modelr)
+library(tidyverse)
+```
+Attempts to leverage data from Moore et al 2004 study on transpiration at HJA WS1 and 2
+
+Load data from digitized csvs
+```{r Data}
+Figure3aData <- read.csv("Data/Moore2004Data/Figure3a.csv")
+Figure3bData <- read.csv("Data/Moore2004Data/Figure3b.csv")
+Figure3cData <- read.csv("Data/Moore2004Data/Figure3c.csv")
+Figure7Data <- read.csv("Data/Moore2004Data/Figure7.csv")
+
+```
+
+Restructure data:
+- Make three df (sap flux 1999 and 2000 and transpiration)
+- Lots of fiddling to get day of year into the right date
+- Aggregate into daily values
+- Linear interpolation of missing values
+- Figures 3a and 3c have PSMEo data, but 3c over a longer duration, so use that data in 2000 sapFlux
+
+```{r structureData}
+sapFlux1999 <- Figure3bData %>% 
+  rename(sFlux = SapFluxDens) %>% 
+  mutate(daysInYear = ifelse(leap_year(year), 366, 365)) %>% 
+  mutate(decimalDate = year + DOY/daysInYear) %>% 
+  mutate(dateTime = date_decimal(decimalDate)) %>% 
+  mutate(DATE = as.Date(dateTime)) %>% 
+  group_by(DATE, tree) %>% 
+  summarise(sFluxDaily = mean(sFlux)) %>% 
+  ungroup() %>% 
+  spread(tree,sFluxDaily) %>% 
+  padr::pad(interval = "day") %>% 
+  mutate(PSMEy = na.approx(PSMEy),
+         ALRUy = na.approx(ALRUy)) %>% 
+  gather(tree, sFlux, PSMEy, ALRUy) %>% 
+  filter(!between(DATE, as.Date("1999-07-29"), as.Date("1999-08-04"))) #Data gap in figure 3b. Interpolate later
+
+sapFlux20003a <- Figure3aData %>% 
+  rename(sFlux = SapFluxDens) %>% 
+  mutate(daysInYear = ifelse(leap_year(year), 366, 365)) %>% 
+  mutate(decimalDate = year + DOY/daysInYear) %>% 
+  mutate(dateTime = date_decimal(decimalDate)) %>% 
+  mutate(DATE = as.Date(dateTime)) %>% 
+  group_by(DATE, tree) %>% 
+  summarise(sFluxDaily = mean(sFlux)) %>% 
+  ungroup() %>% 
+  spread(tree,sFluxDaily) %>% 
+  padr::pad(interval = "day") %>% 
+  mutate(PSMEy = na.approx(PSMEy),
+         PSMEo = na.approx(PSMEo)) %>% 
+  gather(tree, sFlux, PSMEy, PSMEo) %>% 
+  filter(tree == "PSMEy") #Since PSMEo is in Figure 3c data don't need it here
+
+sapFlux2000 <- Figure3cData %>% 
+  rename(sFlux = SapFluxDens) %>% 
+  mutate(daysInYear = ifelse(leap_year(year), 366, 365)) %>% 
+  mutate(decimalDate = year + DOY/daysInYear) %>% 
+  mutate(dateTime = date_decimal(decimalDate)) %>% 
+  mutate(DATE = as.Date(dateTime)) %>% 
+  group_by(DATE, tree) %>% 
+  summarise(sFluxDaily = mean(sFlux)) %>% 
+  ungroup() %>% 
+  spread(tree,sFluxDaily) %>% 
+  padr::pad(interval = "day") %>% 
+  mutate(TSHEo = na.approx(TSHEo, na.rm = FALSE, rule = 2),
+         PSMEo = na.approx(PSMEo)) %>% 
+  gather(tree, sFlux, TSHEo, PSMEo) %>% 
+  bind_rows(sapFlux20003a) #Add PSMEy from figure 3a
+  
+trans2000 <- Figure7Data %>% 
+  mutate(daysInYear = ifelse(leap_year(year), 366, 365)) %>% 
+  mutate(decimalDate = year + DOY/daysInYear) %>% 
+  mutate(dateTime = date_decimal(decimalDate)) %>% 
+  mutate(DATE = as.Date(dateTime)) %>% 
+  group_by(DATE, stand) %>% 
+  summarise(transDaily = mean(trans)) %>% 
+  ungroup() %>% 
+  spread(stand,transDaily) %>% 
+  padr::pad(interval = "day") %>% 
+  mutate(young = na.approx(young),
+         old = na.approx(old)) %>% 
+  gather(stand, trans, young, old)
+
+#Plot these dfs to check how they match with Moore 2004
+Figure3aMoore <- sapFlux2000 %>% 
+  ggplot(aes(x = DATE, y = sFlux)) +
+  geom_line(aes(color = tree))
+print(Figure3aMoore)
+
+Figure3bMoore <- sapFlux1999 %>%
+ggplot(aes(x = DATE, y = sFlux)) +
+  geom_line(aes(color = tree))
+print(Figure3bMoore)
+
+Figure7Moore <- trans2000 %>% 
+  ggplot(aes(x = DATE, y = trans)) +
+  geom_line(aes(color = stand))
+print(Figure7Moore)
+
+```
+
+Now get vpd and radiation data for these same time periods but also as early as march or so to back extrapolate
+```{r metData4Trans}
+vpdMoore <- allData %>% 
+  filter(between(DATE, as.Date("1999-03-01"), as.Date("2000-11-01"))) %>% 
+  select(DATE,meanVpd) %>% 
+  ggplot(aes(x = DATE, y = meanVpd)) + geom_line()
+
+print(vpdMoore)
+
+#Missing data from 2000-6-4 - 2000-6-21 and 2000-5-24 - 2000-5-31. Check if there are other data in this range at primet
+vpdCheck <- vpdRaw %>% 
+  mutate(DATE = ymd(DATE)) %>% 
+  select(DATE,VPD_MEAN_DAY,SITECODE,HEIGHT,PROBE_CODE) %>% 
+  filter(between(DATE, as.Date("2000-05-23"), as.Date("2000-06-01")) |
+         between(DATE, as.Date("2000-06-03"), as.Date("2000-06-22"))) %>% 
+  filter(!is.na(VPD_MEAN_DAY)) %>% 
+  filter(SITECODE %in% c("PRIMET", "CS2MET"))
+
+#Find radiation data for this period
+radRaw <- read.csv("Data/MS00105_v6.csv")
+
+metRad <- radRaw %>% 
+  mutate(DATE = ymd(DATE)) %>% 
+  select(DATE, SOLAR_TOT_DAY, SITECODE, HEIGHT, PROBE_CODE) %>% 
+  filter(between(DATE, as.Date("1999-03-01"), as.Date("2000-11-01"))) %>% 
+  filter(SITECODE == "PRIMET")
+
+radPlot <- metRad %>% 
+  ggplot(aes(x = DATE, y = SOLAR_TOT_DAY)) + geom_line()
+
+print(radPlot)
+#Data gap at 2000-5-24 - 2000-5-31
+```
+
+Check to see what other sensors and stations could be suitable for linear regression interpolation.
+  Requires radRaw loaded in previous chunk from MS00105_v6.csv.
+  First select a data range and create vpd and rad dfs
+```{r gapFillingVpdRad1}
+fromToDates <- c("1999-03-01", "2000-11-01")
+
+#Vpd data from all sites, sensors, heights
+vpdCheck <- vpdRaw %>% 
+  mutate(DATE = ymd(DATE)) %>% 
+  select(DATE,VPD_MEAN_DAY,SITECODE,HEIGHT,PROBE_CODE) %>% 
+  filter(between(DATE, as.Date(fromToDates[1]), as.Date(fromToDates[2])))
+
+#Radiation data from all sites, sensors, heights
+radCheck <- radRaw %>% 
+  mutate(DATE = ymd(DATE)) %>% 
+  select(DATE,SOLAR_TOT_DAY,SITECODE,HEIGHT,PROBE_CODE) %>% 
+  filter(between(DATE, as.Date(fromToDates[1]), as.Date(fromToDates[2])))
+```
+
+  Then get unique combos of site and height and test relationships between each of these and primet data (probe 04, not 05) 
+```{r gapFillingVpdRad2}
+varCheck <- vpdCheck
+datesGap <- c("2000-05-25", "2000-05-30", "2000-06-05", "2000-06-20") #gaps for VPD
+# datesGap <- c("2000-05-25", "2000-05-30") #gaps for radiation
+
+uniqueCombos <- unique(varCheck[ , c("SITECODE","HEIGHT")]) %>% 
+  filter(SITECODE != "PRIMET") %>% 
+  mutate(numNAs = 0)
+
+for (i in 1:nrow(uniqueCombos)) { #:nrow(uniqueCombos)
+  varPRI <- varCheck %>% 
+    filter(SITECODE == "PRIMET") %>% 
+    filter(PROBE_CODE == "VPDPRI04" |
+             PROBE_CODE == "RADPRI01")
+  varOther <- varCheck %>% 
+    filter(SITECODE == uniqueCombos$SITECODE[i]) %>% 
+    filter(HEIGHT == uniqueCombos$HEIGHT[i])
+  
+  #Check how many NAs are in potential predictor data
+  varOtherCheck <- varOther %>% 
+    filter(between(DATE, as.Date(datesGap[1]), as.Date(datesGap[2])) |
+           between(DATE, as.Date(datesGap[3]), as.Date(datesGap[4])))
+  
+  uniqueCombos$numNAs[i] <- sum(is.na(varOtherCheck$VPD_MEAN_DAY))
+  if(uniqueCombos$numNAs[i] != 0) next
+  
+  #Plot bivariate of predictor and PRIMET data
+  tempPlot <- left_join(varPRI, varOther, by = "DATE") %>% 
+    select(DATE, 2, 6) %>% 
+    rename(PRIvar = 2, OtherVar = 3) %>% 
+    drop_na() %>% 
+    ggplot(aes(x = OtherVar, y = PRIvar)) + geom_point() +
+    geom_smooth(formula = y ~ x, method = "lm") +
+    stat_cor(aes(label = after_stat(rr.label)), color = "red", geom = "label") +
+    labs(title = paste(uniqueCombos$SITECODE[i], uniqueCombos$HEIGHT[i], "cm"))
+  print(tempPlot)
+}
+```
+
+Finally use the best models to fill gaps in PRIMET data and save as a single data frame
+  Best Models:
+  - VPD: CS2MET, 150 cm
+  - Radiation: CENMET, 625 cm
+  Requires vpdCheck and radCheck from two chunks up
+```{r gapFillingVpdRad3}
+#Put PRIMET radiation, vpd in same df as predictor variables
+PRIgfVpd <- vpdCheck %>% 
+  filter(SITECODE %in% c("PRIMET", "CS2MET")) %>% 
+  filter(PROBE_CODE != "VPDPRI05") %>% 
+  select(DATE, VPD_MEAN_DAY, SITECODE) %>% 
+  spread(SITECODE, VPD_MEAN_DAY) 
+
+PRIgfRad <- radCheck %>% 
+  filter(SITECODE %in% c("PRIMET", "CENMET")) %>% 
+  select(DATE, SOLAR_TOT_DAY, SITECODE) %>% 
+  spread(SITECODE, SOLAR_TOT_DAY) 
+
+#Find lm, add prediction column, replace NAs in PRIMET with prediction
+vpdReg <- lm(PRIMET ~ CS2MET, data = PRIgfVpd)
+
+PRIgfVpd <- PRIgfVpd %>% 
+  add_predictions(vpdReg) %>% 
+  mutate(gf = ifelse(is.na(PRIMET), 1, 0)) %>% 
+  mutate(PRIMET = ifelse(is.na(PRIMET), pred, PRIMET)) %>% 
+  select(DATE, PRIMET, gf) %>% 
+  mutate(PRIMET = na.approx(PRIMET))
+
+radReg <- lm(PRIMET ~ CENMET, data = PRIgfRad)
+
+PRIgfRad <- PRIgfRad %>% 
+  add_predictions(radReg) %>% 
+  mutate(gf = ifelse(is.na(PRIMET), 1, 0)) %>% 
+  mutate(PRIMET = ifelse(is.na(PRIMET), pred, PRIMET)) %>% 
+  select(DATE, PRIMET, gf) %>% 
+  mutate(PRIMET = na.approx(PRIMET))
+
+#Plot data highlighting gap-fill
+vpdGfPlot <- PRIgfVpd %>% 
+  ggplot(aes(x = DATE, y = PRIMET)) + geom_line(aes(color = gf))
+print(vpdGfPlot)
+  
+radGfPlot <- PRIgfRad %>% 
+  ggplot(aes(x = DATE, y = PRIMET)) + geom_line(aes(color = gf))
+print(radGfPlot)
+
+#Combine gap-filled vpd and radiation data into single df
+gfPRI <- left_join(PRIgfRad, PRIgfVpd, by = "DATE") %>% 
+  select(DATE, Rad = PRIMET.x, Vpd = PRIMET.y)
+```
+
+Now, use the gap filled vpd and radiation data to explore extrapolating transpiration data reported in Moore et al.
+  Using:
+  - trans2000
+  - sapFlux1999
+  - sapFlux2000
+  - gfPRI
+```{r ExtrapolateTrans}
+transEx <- trans2000 %>% 
+  spread(stand, trans) %>% 
+  right_join(., gfPRI, by = "DATE")
+
+#Plot bivariates of transpiration against radiation and against vpd
+# transRadPlot <- transEx %>%
+#   select(DATE, old, young, Rad) %>%
+#   drop_na() %>%
+#   ggplot() +
+#   geom_point(aes(x = Rad, y = old, color = "old")) +
+#   geom_point(aes(x = Rad, y = young, color = "young")) +
+#   labs(y = "Trans")
+# print(transRadPlot)
+# 
+# transVpdPlot <- transEx %>%
+#   select(DATE, old, young, Vpd) %>%
+#   drop_na() %>%
+#   ggplot() +
+#   geom_point(aes(x = Vpd, y = old, color = "old")) +
+#   geom_point(aes(x = Vpd, y = young, color = "young")) +
+#   labs(y = "Trans")
+# print(transVpdPlot)
+
+# Generate a bunch of regression models. 
+RegTransOldVpd <- lm(old ~ Vpd, data = transEx)
+RegTransOldRad <- lm(old ~ Rad, data = transEx)
+RegTransOldVpdRad <- lm(old ~ Rad + Vpd, data = transEx)
+RegTransYoungVpd <- lm(young ~ Vpd, data = transEx)
+RegTransYoungRad <- lm(young ~ Rad, data = transEx)
+RegTransYoungVpdRad <- lm(young ~ Rad + Vpd, data = transEx)
+
+summary(RegTransOldVpd)
+summary(RegTransOldRad)
+summary(RegTransOldVpdRad)
+summary(RegTransYoungVpd)
+summary(RegTransYoungRad)
+summary(RegTransYoungVpdRad)
+# Rad is best predictor by a little. MLM not much of an improvement over just Rad
+
+#Use Radiation to back predict data through April 1
+transExPred <- transEx %>% 
+  add_predictions(model = RegTransOldRad, var = "oldPred") %>% 
+  add_predictions(model = RegTransYoungVpd, var = "youngPred") %>% 
+  mutate(Extrap = ifelse(is.na(old),1,0)) %>% 
+  mutate(old = ifelse(is.na(old), oldPred, old)) %>% 
+  mutate(young = ifelse(is.na(young), youngPred, young)) 
+
+transPredYoungPlot <- transExPred %>%  
+  filter(between(DATE, as.Date("2000-04-01"), as.Date("2000-10-31"))) %>% 
+  ggplot() +
+  geom_line(aes(x = DATE, y = young, color = Extrap))
+print(transPredYoungPlot)
+
+transPredOldPlot <- transExPred %>%  
+  filter(between(DATE, as.Date("2000-04-01"), as.Date("2000-10-31"))) %>% 
+  ggplot() +
+  geom_line(aes(x = DATE, y = old, color = Extrap))
+print(transPredOldPlot)
+
+radPlot <- transExPred %>% 
+  filter(between(DATE, as.Date("2000-04-01"), as.Date("2000-10-31"))) %>% 
+  ggplot() +
+  geom_line(aes(x = DATE, y = Rad))
+print(radPlot)
+```
+Check to see if I can go from sap flux measurements to transpiration figure
+- Input SBA values from fig 6c,d
+- Calculate a 2000 Alder sap flux series from eqn 4 relationship
+- Apply eqn 2 (and divide by 10e4 to account for unit conversions)
+```{r CheckFig3ToFig7}
+Tree <- c("PSME", "TSHE", "ALRU", "Ang", "Gym")
+Old <- c(5.5, 9.9, 0.2, 1.3, 15.9)
+Young <- c(13.9, 0.1, 1.5, 7.7, 13.9)
+
+SBAFig6 <- data.frame(Tree, Old, Young) 
+
+sapFlux2000check <- sapFlux2000 %>% 
+  spread(tree, sFlux) %>%
+  mutate(doy = yday(DATE)) %>% 
+  mutate(ALRUy = PSMEy * (-163 + 165.1 * (1 - exp(-0.0293 * doy)))) %>% 
+  select(-"doy") %>% 
+  gather(key = tree, value = sFlux, PSMEo, PSMEy, TSHEo, ALRUy)
+
+sapFluxPlot <- sapFlux2000check %>% 
+  ggplot(aes(x = DATE, y = sFlux, color = tree)) + geom_line()
+print(sapFluxPlot)
+
+trans2000check <- sapFlux2000check %>% 
+  spread(tree, sFlux) %>% 
+  mutate(TransYoung = (PSMEy*13.9 + ALRUy*7.7)/10000) %>% 
+  mutate(TransOld = (PSMEo*5.5 + TSHEo*9.9 + ALRUy*1.3)/10000)
+
+transCheckPlot <- trans2000check %>% 
+  select(DATE, TransYoung, TransOld) %>% 
+  gather(Stand, Trans, TransYoung, TransOld) %>% 
+  ggplot(aes(x = DATE, y = Trans, color = Stand)) + geom_line()
+
+ggplotly(transCheckPlot)
+```
+
+Get regression relationship between radiation/vpd and 1999 ALRU sapflux, use to extrapolate to 2000 ALRU sapflux.
+  - Uses sapFlux1999 and gfPRI
+  - Met data only during extrapolation period (April 1 - Nov 1)
+```{r ExtrapolateALRUSapFlux}
+ALRUEx <- sapFlux1999 %>% 
+  filter(tree == "ALRUy") %>% 
+  select(DATE, sFlux) %>% 
+  right_join(gfPRI, by = "DATE")
+
+#Plot bivariates of each
+ALRUvRadPlot <- ALRUEx %>% 
+  drop_na() %>% 
+  ggplot(aes(x = Rad, y = sFlux)) + 
+  geom_point() + 
+  geom_smooth(formula = y ~ x, method = "lm") +
+  stat_cor(aes(label = after_stat(rr.label)), color = "red", geom = "label")
+print(ALRUvRadPlot)
+
+ALRUvVpdPlot <- ALRUEx %>% 
+  drop_na() %>% 
+  ggplot(aes(x = Vpd, y = sFlux)) + 
+  geom_point() + 
+  geom_smooth(formula = y ~ x, method = "lm") +
+  stat_cor(aes(label = after_stat(rr.label)), color = "red", geom = "label")
+print(ALRUvVpdPlot)
+
+#Generate linear models and check them
+RegALRUVpd <- lm(sFlux ~ Vpd, data = ALRUEx)
+RegALRURad <- lm(sFlux ~ Rad, data = ALRUEx)
+RegALRUVpdRad <- lm(sFlux ~ Rad + Vpd, data = ALRUEx)
+RegALRUVpdXRad <- lm(sFlux ~ Rad*Vpd, data = ALRUEx)
+
+summary(RegALRUVpd)
+summary(RegALRURad)
+summary(RegALRUVpdRad)
+summary(RegALRUVpdXRad)
+
+#Use vpd and rad to extrapolate ALRU to April 1 - Nov 1 2000
+ALRUExPred <- ALRUEx %>% 
+  add_predictions(model = RegALRUVpdRad, var = "sFluxPred") %>% 
+  mutate(Extrap = ifelse(is.na(sFlux), 1, 0)) %>% #To mark what data is extrapolated vs measured
+  mutate(sFlux = ifelse(is.na(sFlux), sFluxPred, sFlux))
+  
+#Plot extrapolated data
+ALRUPredPlot <- ALRUExPred %>% 
+  filter(between(DATE, as.Date("1999-04-01"), as.Date("2000-10-31"))) %>% 
+  ggplot() +
+  geom_line(aes(x = DATE, y = sFlux, color = Extrap))
+print(ALRUPredPlot)
+```
+
+Do the same for TSHEo, PSMEo, and PSMEy: Find best linear models
+  - PSMEo has lowest R2
+  - Best models generally either vpd or both vpd and rad
+  - Since above (ALRUy) uses both predictors do the same here
+```{r ExtrapolateSapFlux}
+sapFluxEx <- sapFlux2000 %>% 
+  spread(tree, sFlux) %>% 
+  right_join(gfPRI, by = "DATE")
+
+#Plot bivariates between rad/vpd and each tree species/age
+#Radiation
+# for (i in 2:4) {
+#   tempRadPlot <- sapFluxEx %>% 
+#     select(Rad, i) %>% 
+#     drop_na() %>% 
+#     ggplot(aes_string(colnames(.)[1], colnames(.)[2])) + geom_point()
+#   print(tempRadPlot)
+# }
+# 
+# #Vpd
+# for (i in 2:4) {
+#   tempVpdPlot <- sapFluxEx %>% 
+#     select(Vpd, i) %>% 
+#     drop_na() %>% 
+#     ggplot(aes_string(colnames(.)[1], colnames(.)[2])) + geom_point()
+#   print(tempVpdPlot)
+# }
+
+#Find appropriate linear models for each species/age
+#PSMEo
+# lmPSMEoVpd <- lm(PSMEo ~ Vpd, data = sapFluxEx)
+# lmPSMEoRad <- lm(PSMEo ~ Rad, data = sapFluxEx)
+lmPSMEoRadVpd <- lm(PSMEo ~ Rad + Vpd, data = sapFluxEx)
+
+#PSMEy
+# lmPSMEyVpd <- lm(PSMEy ~ Vpd, data = sapFluxEx)
+# lmPSMEyRad <- lm(PSMEy ~ Rad, data = sapFluxEx)
+lmPSMEyRadVpd <- lm(PSMEy ~ Rad + Vpd, data = sapFluxEx)
+
+#TSHEo
+# lmTSHEoVpd <- lm(TSHEo ~ Vpd, data = sapFluxEx)
+# lmTSHEoRad <- lm(TSHEo ~ Rad, data = sapFluxEx)
+lmTSHEoRadVpd <- lm(TSHEo ~ Rad + Vpd, data = sapFluxEx)
+
+# summary(lmPSMEoVpd)
+# summary(lmPSMEoRad)
+# summary(lmPSMEoRadVpd)
+# summary(lmPSMEyVpd)
+# summary(lmPSMEyRad)
+# summary(lmPSMEyRadVpd)
+# summary(lmTSHEoVpd)
+# summary(lmTSHEoRad)
+# summary(lmTSHEoRadVpd)
+
+#Model using both vpd and rad best option for all 3
+sapFluxPred <- sapFluxEx %>% 
+  add_predictions(model = lmPSMEoRadVpd, var = "PSMEoPred") %>% 
+  add_predictions(model = lmPSMEyRadVpd, var = "PSMEyPred") %>% 
+  add_predictions(model = lmTSHEoRadVpd, var = "TSHEoPred") %>% 
+  mutate(Extrap = ifelse(is.na(PSMEo), 1, 0)) %>% #To mark what data is extrapolated vs measured
+  mutate(PSMEo = ifelse(is.na(PSMEo), PSMEoPred, PSMEo),
+         PSMEy = ifelse(is.na(PSMEy), PSMEyPred, PSMEy),
+         TSHEo = ifelse(is.na(TSHEo), TSHEoPred, TSHEo))
+
+#Plot extrapolated data
+PSMEyPredPlot <- sapFluxPred %>% 
+  filter(between(DATE, as.Date("1999-04-01"), as.Date("2000-10-31"))) %>% 
+  ggplot() +
+  geom_line(aes(x = DATE, y = PSMEy, color = Extrap))
+print(PSMEyPredPlot)
+
+PSMEoPredPlot <- sapFluxPred %>% 
+  filter(between(DATE, as.Date("1999-04-01"), as.Date("2000-10-31"))) %>% 
+  ggplot() +
+  geom_line(aes(x = DATE, y = PSMEo, color = Extrap))
+print(PSMEoPredPlot)
+
+TSHEoPredPlot <- sapFluxPred %>% 
+  filter(between(DATE, as.Date("1999-04-01"), as.Date("2000-10-31"))) %>% 
+  ggplot() +
+  geom_line(aes(x = DATE, y = TSHEo, color = Extrap))
+print(TSHEoPredPlot)
+
+#Combine sap flux data from all four species/ages into a single df
+sapFluxAllPred <- sapFluxPred %>% 
+  select(DATE, PSMEo, PSMEy, TSHEo) %>% 
+  left_join(.,ALRUExPred, by = "DATE") %>% 
+  rename(ALRUy = sFlux) %>% 
+  select(-c(Rad, Vpd, sFluxPred, Extrap))
+
+#Plot all sapFlux time series from May 1 through August 30
+sFluxPlot <- sapFluxAllPred %>% 
+  filter(between(DATE, as.Date("2000-05-01"), as.Date("2000-08-31"))) %>% 
+  gather(tree, sFlux, PSMEo, PSMEy, TSHEo, ALRUy) %>% 
+  ggplot(aes(x = DATE, y = sFlux, color = tree)) + geom_line()
+print(sFluxPlot)
+
+```
+
+Data for manuscript figure X (transpiration deficits)
+  - Calculate transpiration from sap flux density values (sapFluxAllPred) and SBA for appropriate classes 
+    - See eqn 2 and related text in Moore et al
+  - For hillslope hypothesis:
+    - Difference between transpiration for the whole watershed - riparian area:
+      - (PSMEo + TSHEo) - PSMEy
+    - Multiplied by ratio of hillslope area to total area
+  - For riparian hypothesis:
+    - Difference between transpiration for just riparian area:
+      - (PSMEo + TSHEo) - ALRUy 
+    - Multiplied by ratio of riparian area to total area
+      
+```{r TranspirationDeficit}
+#Inputs
+StartDate = as.Date("2000-05-01")
+EndDate = as.Date("2000-08-30")
+
+ATot = 96
+ARip = 2.18
+AMoore = 10.46
+AHill = ATot - ARip
+AHillLow = AMoore - ARip
+
+Tree <- c("PSME", "TSHE", "ALRU", "Ang", "Gym")
+Old <- c(5.5, 9.9, 0.2, 1.3, 15.9)
+Young <- c(13.9, 0.1, 1.5, 7.7, 13.9)
+
+#Restructre SBA
+#Modify SBA from Moore to account for "distributing" trees to different subareas of Moore "riparian" area in young stand
+SBAall <- data.frame(Tree, Old, Young) %>% 
+  gather(Stand, SBA, Old, Young) %>% 
+  unite(col = "TreeStand", c("Tree", "Stand"), sep = "") %>% 
+  mutate(SBA = ifelse(TreeStand == "PSMEYoung", (SBA * AMoore/AHillLow), SBA)) %>% #Modified SBA for PSMEy
+  mutate(SBA = ifelse(TreeStand == "AngYoung", (SBA * AMoore/ARip), SBA)) #Modified SBA for ALRUy (use AngYoung)
+
+#Calculate daily transpiration numbers
+TransDef <- sapFluxAllPred %>% 
+  mutate(transPSMEo = PSMEo * SBAall$SBA[SBAall$TreeStand == "PSMEOld"] / 10000,
+         transTSHEo = TSHEo * SBAall$SBA[SBAall$TreeStand == "TSHEOld"] / 10000,
+         transPSMEy = PSMEy * SBAall$SBA[SBAall$TreeStand == "PSMEYoung"] / 10000,
+         transALRUy = ALRUy * SBAall$SBA[SBAall$TreeStand == "AngYoung"] / 10000,
+         transOtherGym = (PSMEo + TSHEo)/2 * SBAall$SBA[SBAall$TreeStand == "GymOld"] / 10000) %>% 
+  mutate(transHillOld =  (transPSMEo + transTSHEo + transOtherGym) * AHill/ATot,
+         transHillYoung = transPSMEy * AHill/ATot,
+         transRipOld = (transPSMEo + transTSHEo + transOtherGym) * ARip/ATot,
+         transRipYoung = transALRUy * ARip/ATot) %>% 
+  mutate(transDefHill = transHillOld - transHillYoung,
+         transDefRip = transRipOld - transRipYoung) %>% 
+  mutate(transOld = transHillOld + transRipOld,
+         transYoung = transHillYoung + transRipYoung) %>% 
+  mutate(transDef = transOld - transYoung) %>% 
+  filter(between(DATE, StartDate, EndDate)) %>% 
+  arrange(DATE)
+
+save(TransDef, file = "TransDef.RData")
+```
+
+Make some plots of transpiration deficits
+```{r TranspirationDeficitPlots}
+#Transpiration from all tree species
+allTreesTransPlot <- TransDef %>% 
+  select(DATE, transPSMEo, transPSMEy, transTSHEo, transALRUy) %>% 
+  rename(PSMEo = transPSMEo,
+         PSMEy = transPSMEy,
+         TSHEo = transTSHEo,
+         ALRUy = transALRUy) %>% 
+  gather(Tree, Trans, PSMEo, PSMEy, TSHEo, ALRUy) %>% 
+  ggplot(aes(x = DATE, y = Trans, color = Tree)) + geom_line()
+print(allTreesTransPlot)
+
+#Overall Transpiration Deficit
+OverallTransDefPlot <- TransDef %>% 
+  select(DATE, transOld, transYoung) %>% 
+  rename(Old = transOld, Young = transYoung) %>% 
+  gather(Stand, Trans, Old, Young) %>% 
+  ggplot(aes(x = DATE, y = Trans, color = Stand)) + geom_line()
+print(OverallTransDefPlot)
+
+#Hillslope Transpiration Deficit
+HillslopeTransDefPlot <- TransDef %>% 
+  select(DATE, transHillOld, transHillYoung, transDefHill) %>% 
+  gather(Stand, Trans, transHillOld, transHillYoung, transDefHill) %>% 
+  ggplot(aes(x = DATE, y = Trans, color = Stand)) + geom_line()
+print(HillslopeTransDefPlot)
+
+#Riparian Transpiration Deficit
+RiparianTransDefPlot <- TransDef %>% 
+  select(DATE, transRipOld, transRipYoung, transDefRip) %>% 
+  gather(Stand, Trans, transRipOld, transRipYoung, transDefRip) %>% 
+  ggplot(aes(x = DATE, y = Trans, color = Stand)) + geom_line()
+print(RiparianTransDefPlot)
+
+#Print out deficit numbers for various 
+sum(TransDef$transDefHill)
+sum(TransDef$transDefHill[between(TransDef$DATE, as.Date("2000-05-16"), as.Date("2000-06-9"))])
+sum(TransDef$transDefHill[between(TransDef$DATE, as.Date("2000-05-01"), as.Date("2000-07-10"))])
+sum(TransDef$transDefRip)
+sum(TransDef$transDef)
+```
+```{r AGU23 Trans Figure}
+#Set colors
+youngCol = "#4dac26"
+oldCol = "#a6611a"
+ripDefCol = "#01665e"
+
+myCols = c(c("Young" = youngCol, "Old" = oldCol, "RipDef" = ripDefCol))
+
+myLineWidth = 2
+myTxtSz = 20
+
+#Add OpenET estimates to TransDef and rescale OpenET estimates to hillslope and riparian areas (ha)
+ATot = 96
+ARip = 2.18
+AHill = ATot - ARip
+
+TransOET <- TransDef %>% 
+  select(DATE, transHillOld, transHillYoung, transDefHill,
+         transRipOld, transRipYoung, transDefRip) %>%
+  mutate(ET_OpenET = 
+    case_when(month(DATE) == 5 ~ WS1_All_OET_month$Mean_Month_ET[5],
+              month(DATE) == 6 ~ WS1_All_OET_month$Mean_Month_ET[6],
+              month(DATE) == 7 ~ WS1_All_OET_month$Mean_Month_ET[7],
+              month(DATE) == 8 ~ WS1_All_OET_month$Mean_Month_ET[8],
+              TRUE ~ 0)) %>% 
+  mutate(ET_OET_Rip = ET_OpenET * ARip/ATot,
+         ET_OET_Hill = ET_OpenET * AHill/ATot)
+
+#Riparian Transpiration Deficit without deficit
+AGUFig <- TransOET %>% 
+  select(DATE, transRipOld, transRipYoung, transDefRip) %>% 
+  ggplot() +
+  geom_area(aes(x = DATE, y = transRipYoung, fill = "Young"), 
+            alpha = 0.3) + 
+  geom_area(aes(x = DATE, y = transRipOld, fill = "Old"), 
+            alpha = 0.3) +
+  geom_area(aes(x = DATE, y = transDefRip, fill = "RipDef"),
+            alpha = 0.7) +
+  theme_classic(base_size = myTxtSz) +
+  theme(panel.border = element_rect(fill=NA)) +
+  scale_fill_manual(name = "", values = myCols) +
+  labs(x = "", y = bquote("Transpiration (mm" ~d^-1*")")) +
+  scale_x_date(expand = c(0,0))
+print(AGUFig)
+
+# #Panel C: Overall Transpiration Deficit
+# myCols = c(Rip = ripDefCol, Hill = hillDefCol)
+# 
+# Fig7c <- TransOET %>% 
+#   select(DATE, transDefRip, transDefHill) %>% 
+#   mutate(Rip = cumsum(transDefRip),
+#          Hill = cumsum(transDefHill)) %>% 
+#   select(-c(transDefRip, transDefHill)) %>% 
+#   gather(Position, sumTrans, Rip, Hill) %>% 
+#   ggplot(aes(x = DATE, y = sumTrans, fill = Position)) +
+#   geom_area(alpha = 0.7) +
+#   scale_fill_manual(name = "", values = myCols) +
+#   theme_bw(base_size = myTxtSz) +
+#   scale_x_date(expand = c(0,0)) +
+#   labs(x = "", y = "\u03A3 Transpiration (mm)")
+# print(OverallTransDefPlot)  
+
+```
+
+
+
+
+
+

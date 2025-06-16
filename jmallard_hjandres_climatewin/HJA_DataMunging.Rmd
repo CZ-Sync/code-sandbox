@@ -1,0 +1,335 @@
+---
+title: "HJAdata"
+author: "Mallard"
+date: "10/24/2022"
+output: html_document
+---
+
+This markdown ingests data from a variety of sources and produces R variables to perform the various analyses included in the following markdown files:
+- HJA_ClimateWindow
+- HJA_TranspirationDeficit
+- HJA_WS1Deficit
+
+Input data are stored in the "...HJA/Data" folder. 
+
+Variables generated from running this entire file are saved as HJA_AnalysisData.RData, which can be loaded to run the three files listed above without rerunning this file.
+
+Loading packages and input data
+```{r packages, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(zoo)
+library(climwin)
+library(plotly)
+library(imputeTS)
+library(ggpubr)
+library(ggthemes)
+```
+
+Input data from HJA online data portal:
+- HF00402: Flow data, daily runoff, inches (normalized to area)
+- MS00103: Precip data, mm
+- HT00401: Temp @ gauges, deg C [per SMW likely to be lower quality temp enclosures]
+- MS00101: Daily (min/max/mean) Temp @ met stations, deg C
+- MS00108: vpd (min/max/mean) @ met stations, mb
+- MS00118: vpd (60 min mean) @m met station, mb
+- MS00102: Relative humidity, %
+```{r inputData, echo=FALSE, message=FALSE}
+qRaw <- read.csv("Data/HF00402_v12.csv")
+precipRaw <- read.csv("Data/MS00103_v8.csv")
+tempRaw <- read.csv("Data/MS00101_v9.csv")
+vpdRaw <- read.csv("Data/MS00108_v9.csv")
+# vpd60minRaw <- read.csv("Data/MS00118_v7.txt")
+rhRaw <- read.csv("Data/MS00102_v9.csv")
+```
+
+MET DATA
+
+Per Steve Wondzell PRIMET is the station to use for precip, CS2MET is likely a bit too overgrown and may be undercatching. PRIMET also site to use for vpd/temp per Chris Daly.
+
+Filter and restructure met:
+- Only one site
+- Combine temp, vpd, and precip
+- Filtering:
+  - Temp
+    - Sensor heights = 1.5 m. (probes 4,5,6)
+    - Probe 5 and 6, or when there's no value for 5,6 use probe 4
+  - Vpd
+    - Sensor height = 1.5 m
+    - Probe 5 or probe 4 after 2000-5-29
+```{r metData, echo=FALSE, message=FALSE}
+metPrecip <- precipRaw %>% 
+  filter(SITECODE == "PRIMET") %>% 
+  select(DATE,PRECIP_TOT_DAY) %>% 
+  rename(precip = PRECIP_TOT_DAY) %>% 
+  mutate(DATE = as_date(DATE))
+
+metTemp <- tempRaw %>% 
+  filter(SITECODE == "PRIMET") %>% 
+  mutate(DATE = as_date(DATE)) %>% 
+  filter(PROBE_CODE %in% c("AIRPRI06", "AIRPRI05", "AIRPRI04")) %>%
+  arrange(DATE, factor(PROBE_CODE, levels = c("AIRPRI06", "AIRPRI05", "AIRPRI04"))) %>% #Sort by probe order here
+  drop_na(AIRTEMP_MEAN_DAY) %>% 
+  distinct(DATE, .keep_all = TRUE) %>% #Takes the first value for that date, so probe 4 only taken if no 5 or 6
+  padr::pad() %>% #Add back NA values
+  select(DATE,AIRTEMP_MEAN_DAY,AIRTEMP_MAX_DAY,AIRTEMP_MIN_DAY) %>% 
+  rename(meanTemp = AIRTEMP_MEAN_DAY, maxTemp = AIRTEMP_MAX_DAY, minTemp = AIRTEMP_MIN_DAY)
+
+metVpd <- vpdRaw %>% 
+  filter(SITECODE == "PRIMET") %>% 
+  mutate(DATE = as_date(DATE)) %>% 
+  filter(HEIGHT == 150) %>% 
+  filter((PROBE_CODE == "VPDPRI05") |
+           ((PROBE_CODE == "VPDPRI04") & (DATE > as_date("2000-05-29")))
+           ) %>% 
+  select(DATE,VPD_MEAN_DAY,VPD_MAX_DAY,VPD_MIN_DAY) %>% 
+  rename(meanVpd = VPD_MEAN_DAY, maxVpd = VPD_MAX_DAY, minVpd = VPD_MIN_DAY)
+
+metRh <- rhRaw %>% 
+  filter(SITECODE == "PRIMET") %>% 
+  mutate(DATE = as_date(DATE)) 
+
+#Create a list of these data frames and then use reduce to sequentially do a full join
+metList <- list(metPrecip, metTemp, metVpd)
+
+met <- metList %>% 
+  reduce(full_join, by = "DATE")
+
+rm(metList) #Cleanup environment
+```
+
+RUNOFF DATA AND COMBINING MET/RUNOFF DATA
+
+Now lets put some datasets together for multiple watersheds (including WS1)
+- WSs 1,2,3,9,10
+- Total Q (in inches), rather than mean, max, min
+- Convert DATE from character to date format
+- Convert inches to mm
+- Reformat as a wide table with WS name as a column name
+- Set dates past 2022 back to 20th century (caused by 2 digit dates in raw data)
+- Reduce to common days b/n met and q, but not all common days for watersheds
+- Add water year column
+- Merge with "met" variable from "metData" chunk to record length of met data
+  - This adds precip, temp (mean, max, min), and vpd (mean, max, min)
+  
+```{r allWSdata}
+#Q data
+allQData <- qRaw %>% 
+  filter(SITECODE %in% c("GSWS01","GSWS02","GSWS03","GSWS09", "GSWS10")) %>% 
+  select(DATE,TOTAL_Q_AREA,SITECODE) %>% 
+  rename(runoff = TOTAL_Q_AREA) %>% 
+  mutate(DATE = mdy(DATE)) %>% 
+  mutate(runoff = runoff * 25.4) %>% 
+  pivot_wider(names_from = SITECODE,values_from = runoff) %>% 
+  rename(WS1 = GSWS01,
+         WS2 = GSWS02,
+         WS3 = GSWS03,
+         WS9 = GSWS09,
+         WS10 = GSWS10) %>% 
+  mutate(DATE = if_else(year(DATE)>2022,DATE-years(100),DATE)) #ymd function has trouble with 2 digit years
+  
+#Merge with met data, add WY column
+allData <- full_join(met, allQData, by='DATE') %>%
+  mutate(yr = year(DATE), mn = month(DATE)) %>%
+  mutate(WY = ifelse(mn > 9, yr + 1, yr)) %>%
+  select(-c(yr,mn))
+```
+
+VPD DATA
+
+Significant gaps in vpd from PRIMET. Using gap-filled daytime vpd data provided by Karla Jarecke. 
+```{r KJ_VPD_data}
+load("Data/EDI_met_daily_daytime_nighttime_stats_20220505.Rdat") #Loads both metdaytime_ and metnighttime_ 
+
+# ggplot_na_distribution(metdaytime_final$vpdmean, x_axis_labels = metdaytime_final$date)
+
+climDataVpd <- metdaytime_final %>% 
+  select(date, vpdmean) %>% 
+  rename(DATE = date, meanVpd = vpdmean) %>% 
+  mutate(txtDate = format(DATE,"%d/%m/%Y")) %>% 
+  filter(year(DATE) >= 1998) #When weirs were put on WSs
+
+```
+
+LOW FLOW DATA
+
+Create an annual low flow dataset.
+
+Calculate a 7-day mean and annual min on the same day every year in WS1,2,3,10. Min day is 7-day window centered on 8/30, doy = 242. 
+```{r WSLowFlowAug}
+#Time series of 7-day mean flow
+WSLowFlowData <- allData %>% 
+  select(DATE, precip, WS1, WS2, WS3, WS9, WS10, meanVpd, meanTemp, WY) %>% 
+  mutate(WS1Low = rollmean(WS1, 7, fill = NA, na.rm = FALSE, align = "center"),
+         WS2Low = rollmean(WS2, 7, fill = NA, na.rm = FALSE, align = "center"),
+         WS3Low = rollmean(WS3, 7, fill = NA, na.rm = FALSE, align = "center"),
+         WS9Low = rollmean(WS9, 7, fill = NA, na.rm = FALSE, align = "center"),
+         WS10Low = rollmean(WS10, 7, fill = NA, na.rm = FALSE, align = "center"))
+
+#Create annual aug low flow
+#Discard before 1979 and after 2018 for incomplete data
+WSLowFlowAnn <- WSLowFlowData %>% 
+  mutate(Year = year(DATE)) %>% 
+  group_by(Year) %>% 
+  summarize(WS1minQAug = WS1Low[yday(DATE) == 242],
+            WS2minQAug = WS2Low[yday(DATE) == 242],
+            WS3minQAug = WS3Low[yday(DATE) == 242],
+            WS9minQAug = WS9Low[yday(DATE) == 242],
+            WS10minQAug = WS10Low[yday(DATE) == 242]) %>% 
+  filter(Year > 1979 & Year < 2019)
+
+#Plot all aug 30 low-flows
+# WSLowFlowAnn %>% 
+#   gather(WS,lowFlowAug,c("WS1minQAug","WS2minQAug","WS3minQAug","WS10minQAug")) %>% 
+#   ggplot(aes(x = Year, y = lowFlowAug, fill = WS)) + geom_bar(position = "dodge", stat = "identity") + theme_classic()
+# 
+# WSLowFlowAnn %>% 
+#   gather(WS,lowFlowAug,c("WS1minQAug","WS2minQAug","WS3minQAug","WS10minQAug")) %>% 
+#   ggplot(aes(x = Year, y = lowFlowAug, color = WS)) + geom_line() + theme_classic()
+
+```
+
+TRANSPIRATION DATA
+
+Load digitized data from Moore et al 2004 Figure 3 and Figure 7
+```{r MooreData}
+Figure3aData <- read.csv("Data/Moore2004Data/Figure3a.csv")
+Figure3bData <- read.csv("Data/Moore2004Data/Figure3b.csv")
+Figure3cData <- read.csv("Data/Moore2004Data/Figure3c.csv")
+Figure7Data <- read.csv("Data/Moore2004Data/Figure7.csv")
+
+```
+
+Restructure data:
+- Make three variables (sap flux 1999 and 2000 and transpiration)
+- Lots of fiddling to get day of year into the right format from decimal days
+- Aggregate into daily values
+- Linear interpolation of missing values
+- Both Figures 3a and 3c have PSMEo data, but 3c over a longer duration, so use that data in 2000 sapFlux
+
+```{r structureMooreData}
+sapFlux1999 <- Figure3bData %>% 
+  rename(sFlux = SapFluxDens) %>% 
+  mutate(daysInYear = ifelse(leap_year(year), 366, 365)) %>% 
+  mutate(decimalDate = year + DOY/daysInYear) %>% 
+  mutate(dateTime = date_decimal(decimalDate)) %>% 
+  mutate(DATE = as.Date(dateTime)) %>% 
+  group_by(DATE, tree) %>% 
+  summarise(sFluxDaily = mean(sFlux)) %>% 
+  ungroup() %>% 
+  spread(tree,sFluxDaily) %>% 
+  padr::pad(interval = "day") %>% 
+  mutate(PSMEy = na.approx(PSMEy),
+         ALRUy = na.approx(ALRUy)) %>% 
+  gather(tree, sFlux, PSMEy, ALRUy) %>% 
+  filter(!between(DATE, as.Date("1999-07-29"), as.Date("1999-08-04"))) #Data gap in figure 3b. Interpolate later
+
+sapFlux20003a <- Figure3aData %>% 
+  rename(sFlux = SapFluxDens) %>% 
+  mutate(daysInYear = ifelse(leap_year(year), 366, 365)) %>% 
+  mutate(decimalDate = year + DOY/daysInYear) %>% 
+  mutate(dateTime = date_decimal(decimalDate)) %>% 
+  mutate(DATE = as.Date(dateTime)) %>% 
+  group_by(DATE, tree) %>% 
+  summarise(sFluxDaily = mean(sFlux)) %>% 
+  ungroup() %>% 
+  spread(tree,sFluxDaily) %>% 
+  padr::pad(interval = "day") %>% 
+  mutate(PSMEy = na.approx(PSMEy),
+         PSMEo = na.approx(PSMEo)) %>% 
+  gather(tree, sFlux, PSMEy, PSMEo) %>% 
+  filter(tree == "PSMEy") #Since PSMEo is in Figure 3c data don't need it here
+
+sapFlux2000 <- Figure3cData %>% 
+  rename(sFlux = SapFluxDens) %>% 
+  mutate(daysInYear = ifelse(leap_year(year), 366, 365)) %>% 
+  mutate(decimalDate = year + DOY/daysInYear) %>% 
+  mutate(dateTime = date_decimal(decimalDate)) %>% 
+  mutate(DATE = as.Date(dateTime)) %>% 
+  group_by(DATE, tree) %>% 
+  summarise(sFluxDaily = mean(sFlux)) %>% 
+  ungroup() %>% 
+  spread(tree,sFluxDaily) %>% 
+  padr::pad(interval = "day") %>% 
+  mutate(TSHEo = na.approx(TSHEo, na.rm = FALSE, rule = 2),
+         PSMEo = na.approx(PSMEo)) %>% 
+  gather(tree, sFlux, TSHEo, PSMEo) %>% 
+  bind_rows(sapFlux20003a) #Add PSMEy from figure 3a
+  
+trans2000 <- Figure7Data %>% 
+  mutate(daysInYear = ifelse(leap_year(year), 366, 365)) %>% 
+  mutate(decimalDate = year + DOY/daysInYear) %>% 
+  mutate(dateTime = date_decimal(decimalDate)) %>% 
+  mutate(DATE = as.Date(dateTime)) %>% 
+  group_by(DATE, stand) %>% 
+  summarise(transDaily = mean(trans)) %>% 
+  ungroup() %>% 
+  spread(stand,transDaily) %>% 
+  padr::pad(interval = "day") %>% 
+  mutate(young = na.approx(young),
+         old = na.approx(old)) %>% 
+  gather(stand, trans, young, old)
+
+#Plot these dfs to check how they match with Moore 2004
+# Figure3aMoore <- sapFlux2000 %>% 
+#   ggplot(aes(x = DATE, y = sFlux)) +
+#   geom_line(aes(color = tree))
+# print(Figure3aMoore)
+# 
+# Figure3bMoore <- sapFlux1999 %>%
+# ggplot(aes(x = DATE, y = sFlux)) +
+#   geom_line(aes(color = tree))
+# print(Figure3bMoore)
+# 
+# Figure7Moore <- trans2000 %>% 
+#   ggplot(aes(x = DATE, y = trans)) +
+#   geom_line(aes(color = stand))
+# print(Figure7Moore)
+
+```
+
+OPEN ET DATA
+
+Read in raw data from WS1, 2, 3 and some subsets of WS1 and WS3
+```{r LoadOpenETData}
+WS1_OpenET_raw <- read.csv("Data/OpenET/WS1_OpenET_Cum.csv")
+WS2_OpenET_raw <- read.csv("Data/OpenET/WS2_OpenET_Cum.csv")
+WS3_OpenET_raw <- read.csv("Data/OpenET/WS3_OpenET_Cum.csv")
+All_OpenET_raw <- read.csv("Data/OpenET/All_WS_Summary.csv")
+WS1Rip_OpenET_raw <- read.csv("Data/OpenET/WS1Rip_OpenET_raw.csv")
+WS3Young_OpenET_raw <- read.csv("Data/OpenET/WS3Young_OpenET_raw.csv")
+WS3Old_OpenET_raw <- read.csv("Data/OpenET/WS3Old_OpenET_raw.csv")
+
+```
+
+Function to restructure OpenET cumulative output data to monthly time series
+```{r RestructureOpenETfxn}
+open_et_cum <- function(csv){
+  csv %>% 
+  gather(Year, ET, c(2,4,6,8,10,12)) %>%
+  select(Category, Year, ET) %>%
+  mutate(Year = as.numeric(str_sub(Year, -4, -1))) %>%
+  mutate(Month = rep(1:12, times = 6)) %>%
+  mutate(DATE = make_date(year = Year, month = Month, day = 1)) %>%
+  select(DATE, ET) %>% 
+  mutate(ET = case_when(month(DATE) == 1 ~ ET,
+                        month(DATE) != 1 ~ ET - lag(ET, n = 1)))
+}
+```
+
+Restructure each OpenET output to time series using function above
+```{r RestructureOpenET}
+WS1_All_OET <- open_et_cum(WS1_OpenET_raw)
+WS2_All_OET <- open_et_cum(WS2_OpenET_raw)
+WS3_All_OET <- open_et_cum(WS3_OpenET_raw)
+WS1_Rip_OET <- open_et_cum(WS1Rip_OpenET_raw)
+WS3_Young_OET <- open_et_cum(WS3Young_OpenET_raw)
+WS3_Old_OET <- open_et_cum(WS3Old_OpenET_raw)
+```
+
+Save the workspace as an Rdata file so this Rmd doesn't need to be used every time
+```{r SaveAnalysisData}
+save.image(file = "Data/HJA_AnalysisData.RData")
+```
+

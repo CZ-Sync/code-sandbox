@@ -1,0 +1,363 @@
+---
+title: "HJAClimWin"
+output: html_notebook
+---
+
+This file applies the base function in the climwin package to examine relationships between climate variables (precip and VPD) at HJA and late summer baseflow
+in WS1, WS2, WS3, WS9, WS10. Then it restructures the output data and visualizes them using custom functions instead of the climwin baked in visualizations. 
+
+Load packages
+```{r LoadPackages}
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(zoo)
+library(climwin)
+library(plotly)
+library(imputeTS)
+library(ggpubr)
+library(ggthemes)
+library(modelr)
+```
+
+
+Get precip data from allData.
+- slidingwin does not work with NAs in the predictive (climate) data. Replace those values with 0
+
+```{r PrecipData}
+climDataPrecip <- allData %>% 
+  select(DATE, precip, meanTemp, meanVpd) %>% 
+  mutate(txtDate = format(DATE,"%d/%m/%Y")) %>% #Format data for use with slidingwin function
+  filter(DATE > as.Date("1998-01-01")) #For when v-notch weirs were put on watersheds revealing error in WS1
+
+climDataPrecip$precip[is.na(climDataPrecip$precip)] <- 0
+```
+
+Get daytime VPD data from that provided by KJ
+
+```{r KJdata}
+load("Data/EDI_met_daily_daytime_nighttime_stats_20220505.Rdat")
+
+# ggplot_na_distribution(metdaytime_final$vpdmean, x_axis_labels = metdaytime_final$date)
+
+climDataVpd <- metdaytime_final %>% 
+  select(date, vpdmean) %>% 
+  rename(DATE = date, meanVpd = vpdmean) %>% 
+  mutate(txtDate = format(DATE,"%d/%m/%Y")) %>% 
+  filter(year(DATE) >= 1998) #When weirs were put on WSs
+```
+
+Get low flow data for WSXLowFlow data
+- extract data for all WS low flow Aug 30
+
+```{r LowFlowData}
+lowFlowData <- WSLowFlowAnn %>% 
+  ungroup() %>% 
+  select(WS1minQAug, WS2minQAug, WS3minQAug, WS9minQAug, WS10minQAug, Year) %>% 
+  mutate(txtDate = paste0("30/08/",Year)) %>% 
+  filter(Year > 1998) #V-notch weirs see above note
+```
+
+Executing sliding window for both precip and vpd and save default output as a single structure.
+- Output is saved at end of chunk because runtime is ~5 min on 2.6 GHz 6 core Intel i7
+```{r ClimaWinDataExec2}
+# Select which watersheds to use out of all possible:
+# WSvarnames <- c("WS1minQAug","WS2minQAug","WS3minQAug", "WS9minQAug", "WS10minQAug")
+WSvarnames <- c("WS1minQAug", "WS2minQAug")
+
+#preallocate lists
+climWinModelsPrecip <- vector(mode = "list", length = length(WSvarnames)) 
+climWinModelsVpd <- vector(mode = "list", length = length(WSvarnames)) 
+
+for (i in 1:length(WSvarnames)){
+  lowFlowTemp <- lowFlowData %>% #Extract specific WS and remove rows with NA
+    select(Year, txtDate, minQ = WSvarnames[i]) %>% 
+    drop_na()
+  
+  #Precip  
+  winOut <- slidingwin(xvar = list(climDataPrecip$precip),
+                     cdate = climDataPrecip$txtDate,
+                     bdate = lowFlowTemp$txtDate,
+                     baseline = lm(minQ ~ 1, data = lowFlowTemp),
+                     cinterval = "day",
+                     range = c(365,10),
+                     type = "relative",
+                     stat = "sum",
+                     func = "lin",
+                     cmissing = "method2" #This method replaces missing values with mean value of all records with same date
+                     )
+
+  climWinModelsPrecip[[i]] <- winOut[[1]]$Dataset
+  
+  #Vpd
+  winOut <- slidingwin(xvar = list(climDataVpd$meanVpd),
+                     cdate = climDataVpd$txtDate,
+                     bdate = lowFlowTemp$txtDate,
+                     baseline = lm(minQ ~ 1, data = lowFlowTemp),
+                     cinterval = "day",
+                     range = c(365,10),
+                     type = "relative",
+                     stat = "mean",
+                     func = "lin",
+                     cmissing = "method2" #This method replaces missing values with mean value of all records with same date
+                     )
+
+  climWinModelsVpd[[i]] <- winOut[[1]]$Dataset
+}
+
+#Save these files
+save(climWinModelsPrecip, climWinModelsVpd, file = "climWinOutputs.RDat")
+```
+
+Filter models to only those greater than some length of time and look at box plots and tile plots of top X open and close windows. Visualize these results with boxplots and tile plots.
+```{r TopModels}
+#inputs
+winLength <- 14 #number of days of minimum window
+numTopModels <- 40 #top number of models as ranked by AIC to plot
+
+#Pre-allocate data frame
+topClimModels <- data.frame(deltaAICc = double(),
+                            WindowOpen = integer(),
+                            WindowClose = integer(),
+                            WSname = character(),
+                            climPred = character())
+
+for (i in 1:length(WSvarnames)) {
+  #Precip models
+  tempClimModels <- climWinModelsPrecip[[i]] %>% 
+    select(deltaAICc, WindowOpen, WindowClose) %>% 
+    mutate(WSname = str_sub(WSvarnames[i], 1, -8),
+           climPred = "precip") %>% 
+    mutate(lengthWin = WindowOpen - WindowClose + 1) %>% 
+    filter(lengthWin >= winLength) %>% 
+    select(-lengthWin) %>% 
+    slice_min(deltaAICc, n = numTopModels)
+  
+  topClimModels <- rbind(topClimModels,tempClimModels)
+  
+  #Vpd models
+  tempClimModels <- climWinModelsVpd[[i]] %>% 
+    select(deltaAICc, WindowOpen, WindowClose) %>% 
+    mutate(WSname = str_sub(WSvarnames[i], 1, -8),
+           climPred = "vpd") %>% 
+    mutate(lengthWin = WindowOpen - WindowClose + 1) %>% 
+    filter(lengthWin >= winLength) %>% 
+    select(-lengthWin) %>% 
+    slice_min(deltaAICc, n = numTopModels)
+  
+  topClimModels <- rbind(topClimModels,tempClimModels)
+} 
+
+#Plot tile plots of top models
+winDaysVec <- min(topClimModels$WindowClose):max(topClimModels$WindowOpen) #Create vector of all days in any window 
+
+WSPredCombos <- unique(topClimModels[c("WSname", "climPred")])
+WSCombos <- WSPredCombos$WSname
+PredCombos <- WSPredCombos$climPred
+
+tileTopModels <- data.frame(winDay = rep(winDaysVec, each = nrow(WSPredCombos))) %>%
+  mutate(WS = rep(WSCombos, times = length(winDaysVec))) %>% 
+  mutate(climVar = rep(PredCombos, times = length(winDaysVec))) %>% 
+  mutate(nModDay = 0)
+
+for (i in 1:nrow(tileTopModels)) {
+  tempTopClimModels <- topClimModels %>% 
+    filter(WSname == tileTopModels$WS[i] & 
+             climPred == tileTopModels$climVar[i]) %>% 
+    filter(WindowClose <= tileTopModels$winDay[i] &
+             WindowOpen >= tileTopModels$winDay[i])
+  
+  tileTopModels$nModDay[i] <- nrow(tempTopClimModels)
+}
+
+tileTopModels$winDay <- winDays2Dates(tileTopModels$winDay) #Convert window days into actual dates
+
+save(tileTopModels, file = "ManuscriptDocuments/Figures/FigureData/ClimWinTile.RData")
+
+tilePlots <- tileTopModels %>% 
+  ggplot(aes(x = winDay, y = WS, fill = nModDay)) +
+  geom_tile() + facet_wrap(~ climVar) +
+  labs( # title = paste("Top ", numTopModels, " models explaining Aug 30 low flow"),
+       x = "Open and close days",
+       y = "Watershed",
+       fill = "# of models"
+       ) +
+  theme_bw(base_size = 20)
+print(tilePlots)
+ggplotly(tilePlots)
+```
+
+Function is for converting window open and window close days to dates for plotting purposes
+```{r days2datesBeforeAug30}
+winDays2Dates <- function(d) {
+  doys <- 241 - d #Convert day before Aug 30 to day of year. R starts from day 0 not 1
+  output <- as.Date(doys, origin = "2023-01-01")
+}
+```
+
+NOT USED FOR MANUSCRIPT
+
+Look at individual model fits. Choose which model to plot based on best models output from slidingwin output and then use singlewin to get the specific model
+```{r plotIndvModels}
+winOpen <- 356
+winClose <- 1
+ws <- 2 #Which watershed: WS1, WS2, WS3, WS9, WS10
+climVar <- "Precip" #Precip or VPD
+
+WSvarnames <- c("WS1minQAug","WS2minQAug","WS3minQAug", "WS9minQAug", "WS10minQAug")
+WSnames <- str_sub(WSvarnames, 1, -8)
+
+#Select correct climate data
+if (climVar == "Precip"){
+  climDataTemp <- climDataPrecip %>% 
+    select(txtDate, climPredictor = precip)
+} else if (climVar == "VPD"){
+  climDataTemp <- climDataVpd %>% 
+    select(txtDate, climPredictor = meanVpd)
+} else {
+  stop("climVar must be precip vpd")
+}
+
+#Select correct watershed data
+lowFlowDataTemp <- lowFlowData %>% 
+  select(txtDate, minQAug = WSvarnames[ws])
+
+#Select correct method for if it's precip (sum) or vpd (mean)
+if (climVar == "Precip") {
+  statType <- "sum"
+} else if (climVar == "VPD") {
+  statType <- "mean" 
+} else {
+  stop("climVar must be precip vpd")
+}
+
+#Get model to plot
+model2plot <- singlewin(xvar = list(climDataTemp$climPredictor),
+                     cdate = climDataTemp$txtDate,
+                     bdate = lowFlowDataTemp$txtDate,
+                     baseline = lm(minQAug ~ 1, data = lowFlowDataTemp),
+                     cinterval = "day",
+                     range = c(winOpen, winClose),
+                     type = "relative",
+                     stat = statType,
+                     func = "lin",
+                     cmissing = "method2" #This method replaces missing values with mean value of all records with same date
+                     )
+
+#Select correct output dataset for climate variable
+if (climVar == "Precip") {
+  climDataset <- climWinModelsPrecip[[ws]]
+} else if (climVar == "VPD") {
+  climDataset <- climWinModelsVpd[[ws]]
+} else {
+  stop("climVar must be 1 for precip or 2 for vpd")
+}
+  
+plotbest(dataset = climDataset, 
+         bestmodel = model2plot$BestModel,
+         bestmodeldata = model2plot$BestModelData)
+
+#Manual version of above plot
+modelPlot <- ggplot(data = model2plot$BestModelData, aes(x = climate, y = yvar)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  theme_bw() + 
+  stat_cor(aes(label = after_stat(rr.label)), color = "red", geom = "label") +
+  labs(title = paste("Window", climVar, "vs Aug 30 LF for", WSnames[ws]),
+       y = "7 day mean Q (mm/day)",
+       x = "Total precip (mm)")
+print(modelPlot)
+```
+
+When analysis was run using only data from post v-notch weirs, WS1 had a strong set of models in the first to second week of september. Exploring what might have caused that and whether it appears to be spurious or not. A single extreme value is levering R2
+```{r SeptWinInWS1}
+#Look at low flow values for each WS
+lowFlowPlot <- lowFlowData %>% 
+  select(Year,
+         WS1 = WS1minQAug, 
+         WS2 = WS2minQAug,
+         WS3 = WS3minQAug) %>% 
+  gather(key = WS, value = LF, WS1:WS3) %>% 
+  ggplot(aes(x = Year, y = LF, color = WS)) + geom_line()
+
+print(lowFlowPlot)
+
+#Look at some of those models:
+# Highest model for WS1
+plot_indv_win_mod(358, 356, 1, "Precip")
+# Same window for WS3
+plot_indv_win_mod(358, 356, 3, "Precip")
+
+# Models closer to original window
+plot_indv_win_mod(95, 83, 1, "Precip")
+plot_indv_win_mod(95, 83, 3, "Precip")
+
+```
+
+Function replicating content of PlotIndvModels chunk
+```{r plotIndvWinModelsFunction}
+#Inputs:
+# WinO and WinC are open and close days from climwin outputs
+# wsNum is which of wss 1-3 (1-3), 9 (4), 10 (5)
+# cVar is either "Precip" or "VPD"
+
+#Requires in Environment:
+# climDataPrecip and climDataVpd
+# lowFlowData
+# climWinModelsPrecip
+plot_indv_win_mod <- function(winO, winC, wsNum, cVar) {
+  
+  WSLFnames <- c("WS1minQAug","WS2minQAug","WS3minQAug", "WS9minQAug", "WS10minQAug")
+  WS <- str_sub(WSvarnames, 1, -8)
+  
+  #Select correct climate data
+  if (cVar == "Precip"){
+    climDataFnc <- climDataPrecip %>% 
+      select(txtDate, climPredictor = precip)
+  } else if (cVar == "VPD"){
+    climDataFnc <- climDataVpd %>% 
+      select(txtDate, climPredictor = meanVpd)
+  } else {
+    stop("cVar must be precip vpd")
+  }
+  
+  #Select correct watershed data
+  lowFlowDataFnc <- lowFlowData %>% 
+    select(txtDate, minQAug = WSLFnames[wsNum])
+  
+  #Select correct method for if it's precip (sum) or vpd (mean)
+  if (cVar == "Precip") {
+    statType <- "sum"
+  } else if (cVar == "VPD") {
+    statType <- "mean" 
+  } else {
+    stop("cVar must be precip vpd")
+  }
+  
+  #Get model to plot
+  model2plotFnc <- singlewin(xvar = list(climDataFnc$climPredictor),
+                          cdate = climDataFnc$txtDate,
+                          bdate = lowFlowDataFnc$txtDate,
+                          baseline = lm(minQAug ~ 1, data = lowFlowDataFnc),
+                          cinterval = "day",
+                          range = c(winO, winC),
+                          type = "relative",
+                          stat = statType,
+                          func = "lin",
+                          cmissing = "method2" #This method replaces missing values with mean value of all records with same date
+  )
+  
+  #Manual version of above plot
+  modelPlot <- ggplot(data = model2plotFnc$BestModelData, aes(x = climate, y = yvar)) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    theme_bw() + 
+    stat_cor(aes(label = after_stat(rr.label)), color = "red", geom = "label") +
+    labs(title = paste("Window", cVar, "vs Aug 30 LF for", WS[wsNum],
+                       format(winDays2Dates(winO), format = "%m-%d"), "-",
+                       format(winDays2Dates(winC), format = "%m-%d")),
+         y = "7 day mean Q (mm/day)",
+         x = "Total precip (mm)")
+  print(modelPlot)
+}
+```
