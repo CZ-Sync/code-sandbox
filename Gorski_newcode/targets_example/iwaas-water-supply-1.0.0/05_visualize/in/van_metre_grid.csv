@@ -1,0 +1,19 @@
+name,code,row,col
+Northeast 1,1,1,6
+Atlantic Coast 2,2,3,6
+Florida 3,3,4,6
+Great Lakes 4,4,1,5
+Midwest 5,5,2,5
+Tennessee-Missouri 6,6,3,5
+Mississippi Embayment 7,7,3,4
+Gulf Coast 8,8,4,5
+Souris-Red-Rainy 9,9,1,4
+Northern High Plains 10,10,1,3
+Central High Plains 11,11,2,3
+Southern High Plains 12,12,3,3
+Texas 13,13,4,4
+Columbia-Snake 14,14,1,2
+Central Rockies 15,15,2,2
+Southwest Desert 16,16,3,2
+Pacific Northwest 17,17,1,1
+California-Nevada 18,18,2,1

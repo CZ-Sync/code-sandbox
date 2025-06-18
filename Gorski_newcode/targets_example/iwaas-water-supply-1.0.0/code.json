@@ -1,0 +1,51 @@
+[
+  {
+    "name": "iwaas-water-supply",
+    "organization": "U.S. Geological Survey",
+    "description": "Analysis of monthly water supply for the United States for water years 2010-2020 using modeled states and fluxes",
+    "version": "1.0.0",
+    "status": "Production",
+    "permissions": {
+      "usageType": "openSource",
+      "licenses": [
+        {
+          "name": "Public Domain, CC0-1.0",
+          "URL": "https://code.usgs.gov/wma/national-iwaas/NWAA/nwaa-1a-releases/iwaas-water-supply/-/raw/1.0.0/LICENSE.md"
+        }
+      ]
+    },
+
+    "homepageURL": "https://www.usgs.gov/mission-areas/water-resources/science/integrated-water-availability-assessments-iwaas",
+    "downloadURL": "https://code.usgs.gov/wma/national-iwaas/NWAA/nwaa-1a-releases/iwaas-water-supply/-/archive/1.0.0/iwaas-water-supply-1.0.0.zip",
+    "disclaimerURL": "https://code.usgs.gov/wma/national-iwaas/NWAA/nwaa-1a-releases/iwaas-water-supply/-/raw/1.0.0/DISCLAIMER.md",
+    "repositoryURL": "https://code.usgs.gov/wma/national-iwaas/NWAA/nwaa-1a-releases/iwaas-water-supply.git",
+    "vcs": "git",
+
+    "laborHours": 0,
+
+    "tags": [
+      "hydrology",
+      "IWAAs",
+      "water availablility",
+      "NHM-PRMS",
+      "WRF-Hydro",
+      "uncertainty",
+      "water supply",
+      "R"
+
+    ],
+
+    "languages": [
+      "R"
+    ],
+
+    "contact": {
+      "name": "Anthony Martinez",
+      "email": "ajmartinez@usgs.gov"
+    },
+
+    "date": {
+      "metadataLastUpdated": "2025-01-03"
+    }
+  }
+]
