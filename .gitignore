@@ -173,3 +173,7 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 .Rproj.user
+
+# Gitignore the example targets outputs
+LPlatt_Targets_Example/_targets
+LPlatt_Targets_Example/*.png
