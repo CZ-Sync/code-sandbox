@@ -23,3 +23,14 @@ your current working directory.
 R session by running `library(targets)`. If it fails, it means your package 
 install during step 1 was not successful. Try doing that again.
 1. **Build the pipeline.** Build the full pipeline by running `tar_make()`.
+1. **Inspect outputs.** You should now see 4 PNG files in the folder. The pipeline
+created these! You can inspect the data downloaded by loading the target output into 
+your environment with `tar_load(p1_flow_daily_tbl)`.
+1. **Make a change and rebuild.** Try changing something about the pipeline and rebuild
+to see how the pipeline handles this. You could edit some aesthetic about the plots,
+you could add a new site number to `p1_sites` (e.g. '05587450' which is the Mississippi
+River at Grafton Illinois), or you could change the plot filenames. Then, run `tar_make()` 
+again and observe what rebuilt and what was skipped.
+
+Hopefully this small example gives you a taste of how this approach can be powerful for
+managing large, complex workflows or just helping you stay organized with your code.
