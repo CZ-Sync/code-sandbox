@@ -177,3 +177,74 @@ cython_debug/
 # Gitignore the example targets outputs
 LPlatt_Targets_Example/_targets
 LPlatt_Targets_Example/*.png
+
+#snoflo 
+*.DS_Store*
+
+snoflo/_targets/
+
+#01_basin_match
+snoflo/01_basin_match/in/*
+!snoflo/01_basin_match/in/.empty
+snoflo/01_basin_match/out/*
+!snoflo/01_basin_match/out/.empty
+
+#02_data_ingest
+snoflo/02_data_ingest/in/*
+!snoflo/02_data_ingest/in/.empty
+snoflo/02_data_ingest/out/*
+!snoflo/02_data_ingest/out/.empty
+
+#03_metrics
+snoflo/03_metrics/in/*
+!snoflo/03_metrics/in/.empty
+snoflo/03_metrics/out/*
+!snoflo/03_metrics/out/.empty
+
+#04_trends
+snoflo/04_trends/in/*
+!snoflo/04_trends/in/.empty
+snoflo/04_trends/out/*
+!snoflo/04_trends/out/.empty
+
+#05_joint_metrics
+snoflo/05_joint_metrics/in/*
+!snoflo/05_joint_metrics/in/.empty
+snoflo/05_joint_metrics/out/*
+!snoflo/05_joint_metrics/out/.empty
+
+#06_te
+snoflo/06_te/in/*
+!snoflo/06_te/in/.empty
+snoflo/06_te/out/*
+!snoflo/06_te/out/.empty
+
+#07_summarize
+snoflo/07_summarize/in/*
+!snoflo/07_summarize/in/.empty
+snoflo/07_summarize/out/*
+!snoflo/07_summarize/out/.empty
+
+
+
+#####
+#could add the next steps as neccessary
+
+
+### R ###
+# History files
+.Rhistory
+.Rapp.history
+
+# Session Data files
+.RData
+
+# User-specific files
+.Ruserdata
+
+# RStudio files
+.Rproj.user/
+
+# R Environment Variables
+.Renviron
+
