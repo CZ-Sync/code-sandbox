@@ -1,0 +1,12 @@
+# Ignore all input and output directories
+in/
+out/
+
+# Ignore other directories
+vault/
+docker/
+_targets/
+
+# Ignore files
+*scratch*
+*.slurm
