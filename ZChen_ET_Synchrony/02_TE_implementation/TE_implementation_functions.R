@@ -139,7 +139,7 @@ joint_entropy <- function(joint_index){
 }
 
 # This function is the wrapped function to calculate TE from var1 to var2
-# TE(x->Y) = H(Yt,Yt-1) + H(Yt-1,Xt-lag) - H(Yt-1) - H(Xt-lag,Yt,Yt-1)
+# TE(x->Y) = H(Yt,Yt-1) + H(Yt-1,Xt-lag) - H(Yt-1) - H(Yt,Yt-1,Xt-lag)
 # Input includes:
 # TS of the source: var1
 # TS of the sink: var2
@@ -151,7 +151,7 @@ joint_entropy <- function(joint_index){
 cal_transfer_entropy <- function(var1,var2,nbins,lower_qt,upper_qt,lag,cr = FALSE,ZFlag_Source,ZFlag_Sink){
   # Total length of the TS
   n <- length(var2)
-  x_lag <- var1[1:(n-lag-1)]
+  x_lag <- var1[2:(n-lag)]
   yt <- var2[(lag+2):n]
   yt_1 <- var2[(lag+1):(n-1)]
   
@@ -163,6 +163,7 @@ cal_transfer_entropy <- function(var1,var2,nbins,lower_qt,upper_qt,lag,cr = FALS
   if(cr){
     # This destroy the temporal structure while keeping the distribution of values intact
     M <- shuffle_matrix(M)
+    M <- M[complete.cases(M),]
     x_lag <- M[,1]
     yt <- M[,2]
     yt_1 <- M[,3]
@@ -210,7 +211,7 @@ Cal_TE_main <- function(var1,var2,max_lag,nbins,alpha=0.05,nshuffle = 300,upper_
       cal_transfer_entropy(var1,var2,nbins,lower_qt,upper_qt,lag=0,cr=TRUE,ZFlag_Source = ZFlag_Source,ZFlag_Sink = ZFlag_Sink)
     })
     # Get critical TE based on T-statistics
-    t_crit <- qt(1-alpha,df = nshuffle - 1)
+    t_crit <- qt(1-alpha,df = 100)
     cr_TE_global <- mean(TE_shuffled_global,na.rm=TRUE) + t_crit*sd(TE_shuffled_global,na.rm=TRUE)
   }
   
@@ -230,7 +231,7 @@ Cal_TE_main <- function(var1,var2,max_lag,nbins,alpha=0.05,nshuffle = 300,upper_
         })
         
         # Critical TE, using T-statistics
-        t_crit <- qt(1-alpha,nshuffle - 1)
+        t_crit <- qt(1-alpha,df = 100)
         cr_TE <- mean(TE_shuffled,na.rm=TRUE) + t_crit*sd(TE_shuffled,na.rm=TRUE)
       }else{
         cr_TE <- cr_TE_global
