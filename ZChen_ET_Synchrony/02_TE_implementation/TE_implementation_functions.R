@@ -29,46 +29,74 @@ fold_outliers <- function(var,lower_qt,upper_qt){
   return(var)
 }
 
-# This function is to adjust zero values in the data when discretizing continuous data, true zero values are put in the first bin
+# This function is to calculate binning edges when discretizing continuous data
 # Input are:
-# TS data to be processed (x)
+# TS data to be processed: var
 # number of total bins for descretization: nbins
 # lower and upper quantile for the outliers
-# Output is: the bin of each value
-zero_adjustment <- function(var,nbins,lower_qt = NULL,upper_qt = NULL){
+# Output: the edges for binning
+get_binning_edges <- function(var,nbins,lower_qt = NULL, upper_qt = NULL){
   # a tiny value to expand the two edges
-  ths <- 1e-6
-  # Deal with outliers
+  ths <- 1e-4
+  # Remove outliers in the data
   var <- fold_outliers(var,lower_qt,upper_qt)
-  
+  # Non-zero values
+  nonzero <- var[var!=0 & !is.na(var)]
+  # Get the range of data for binning
+  lower_bd <- min(nonzero) - ths
+  upper_bd <- max(nonzero) + ths
+  # Get breaks (note, for nbins, the edge should be nbins+1)
+  breaks <- seq(lower_bd,upper_bd,length.out = nbins + 1)
+  return(breaks)
+}
+
+# This function is to adjust zero values in the data when discretizing continuous data, true zero values are put in the first bin
+# Input are:
+# TS data to be processed: var
+# number of total bins for descretization: nbins
+# lower and upper quantile for the outliers
+# If ZFlag is TRUE: zero-adjustment is needed; if FALSE: no zero-adjustment
+# Output is: the bin of each value
+zero_adjustment <- function(var,nbins,lower_qt = NULL, upper_qt = NULL,ZFlag){
   # Initialize a vector to store results (location of bins)
   bin_loc <- rep(NA,length(var))
-  # Index for zero values
+  # Index for zero and non-zero values
   zero_idx <- which(var == 0)
   nonzero_idx <- which(var!=0 & !is.na(var))
   # Non-zero values
   var_nonzero <- var[nonzero_idx]
   
-  # Get the range of data for binning
-  lower_bd <- min(var_nonzero) - ths
-  upper_bd <- max(var_nonzero) + ths
+  # Determine number of bins for non-zero values
+  non_zero_bins <- if(ZFlag) nbins-1 else nbins
   
-  # Get breaks
-  breaks <- seq(lower_bd,upper_bd,length.out = nbins)
+  # Get bin edges and bin the non-zero values
+  breaks <- get_binning_edges(var_nonzero,nbins=non_zero_bins,lower_qt,upper_qt)
+  bins <- cut(var_nonzero,breaks=breaks,include.lowest = TRUE,labels = FALSE,right = FALSE)
   
-  # Discretize non-zero values to bins 2 and more
-  bins <- cut(var_nonzero,breaks = breaks,include.lowest = TRUE,labels = FALSE)
-
-  if(length(zero_idx != 0)){
+  # Shift bins if zero exists, and put zero in the first bin
+  if(ZFlag){
     bins <- bins + 1
-    # Assign 0 to the first bin
     bin_loc[zero_idx] <- 1
   }
-
-  # Assign non-zero values to their corresponding bins
+  # Assign the bins to non-zero values
   bin_loc[nonzero_idx] <- bins
-  
   return(bin_loc)
+}
+
+# This function is to shuffle matrix, for calculation of critical TE values
+# It shuffles each column in the matrix, while preserving the locations of NA
+# Input is the matrix to shuffle
+shuffle_matrix <- function(M){
+  # Initialize a blank matrix
+  M0 <- matrix(NA,nrow=nrow(M),ncol=ncol(M))
+  # Loop over the columns
+  for(i in 1:ncol(M)){
+    col_values <- M[,i]
+    non_na_idx <- which(!is.na(col_values))
+    shuffled_values <- sample(col_values[non_na_idx])
+    M0[non_na_idx,i] <- shuffled_values
+  }
+  return(M0)
 }
 
 # This function calculates entropy based on the bins
@@ -82,12 +110,30 @@ cal_entropy <- function(counts){
   return(H)
 }
 
+# This function takes one or more binned vectors and returns the joint bin 1D (1 to nbins^k)
+# This ensures that each individual combination of bins is transformed to a unique 1D value
+# Input include:
+# ...: The bin vectors for each of the TS variables
+# nbins: number of bins
+joint_bin_index <- function(...,nbins){
+  binned_list <- list(...)
+  # Convert binned vectors into joint indices
+  joint_index <- rep(0,length(binned_list[[1]]))
+  k <- length(binned_list)
+  for(i in 1:k){
+    # e.g., for 3D: (b1 - 1)*nbins^2 + (b2-1)^nbins + b3
+    joint_index <- joint_index + (binned_list[[i]]-1)*nbins^(k-i)
+  }
+  joint_index <- joint_index[!is.na(joint_index)]
+  return(joint_index + 1)
+}
+
 # This function calculates joint Shannon entropy from multiple variables
 # Inputs are the vectors of the bins of which values in TS belong to
-joint_entropy <- function(...){
-  df <- data.frame(...)
+# Input is the joint_index, calculated from joint_bin_index
+joint_entropy <- function(joint_index){
   # Get the joint distribution of multiple variables
-  counts <- table(df)
+  counts <- table(joint_index)
   H <- cal_entropy(as.numeric(counts))
   return(H)
 }
@@ -100,30 +146,38 @@ joint_entropy <- function(...){
 # # of bins for discretization: nbins
 # lower and upper quantiles to deal with outliers
 # cr is a logical value, if TRUE, it means this run is for critical values, then TS are shuffled
-cal_transfer_entropy <- function(var1,var2,nbins,lower_qt,upper_qt,lag,cr = FALSE){
+# ZFlag_Source is whether the Source needs zero adjustment (TURE or FALSE)
+# ZFlag_Sink is whether the Sink needs zero adjustment (TURE or FALSE)
+cal_transfer_entropy <- function(var1,var2,nbins,lower_qt,upper_qt,lag,cr = FALSE,ZFlag_Source,ZFlag_Sink){
   # Total length of the TS
   n <- length(var2)
   x_lag <- var1[1:(n-lag-1)]
   yt <- var2[(lag+2):n]
   yt_1 <- var2[(lag+1):(n-1)]
   
+  # Put them into a matrix
+  M <- cbind(x_lag,yt,yt_1)
+  # Remove rows if there is any NA, to ensure complete observations
+  M <- M[complete.cases(M),]
+
   if(cr){
     # This destroy the temporal structure while keeping the distribution of values intact
-    yt <- sample(yt)
-    yt_1 <- sample(yt_1)
-    x_lag <- sample(x_lag)
+    M <- shuffle_matrix(M)
+    x_lag <- M[,1]
+    yt <- M[,2]
+    yt_1 <- M[,3]
   }
 
   # Adjust for zero and get bins
-  x_lag_bins <- zero_adjustment(x_lag,nbins,lower_qt,upper_qt)
-  yt_bins <- zero_adjustment(yt,nbins,lower_qt,upper_qt)
-  yt_1_bins <- zero_adjustment(yt_1,nbins,lower_qt,upper_qt)
+  x_lag_bins <- zero_adjustment(M[,1],nbins,lower_qt,upper_qt,ZFlag_Source)
+  yt_bins <- zero_adjustment(M[,2],nbins,lower_qt,upper_qt,ZFlag_Sink)
+  yt_1_bins <- zero_adjustment(M[,3],nbins,lower_qt,upper_qt,ZFlag_Sink)
   
   # Calculate entropy
-  H_ytyt_1 <- joint_entropy(yt_bins,yt_1_bins)
-  H_yt_1_x_lag <- joint_entropy(yt_1_bins,x_lag_bins)
-  H_yt_1 <- cal_entropy(table(yt_1_bins))
-  H_y_yt_1_x_lag <- joint_entropy(yt_bins,yt_1_bins,x_lag_bins)
+  H_ytyt_1 <- joint_entropy(joint_bin_index(yt_bins,yt_1_bins,nbins = nbins))
+  H_yt_1_x_lag <- joint_entropy(joint_bin_index(yt_1_bins,x_lag_bins,nbins = nbins))
+  H_yt_1 <- joint_entropy(joint_bin_index(yt_1_bins,nbins=nbins))
+  H_y_yt_1_x_lag <- joint_entropy(joint_bin_index(yt_bins,yt_1_bins,x_lag_bins,nbins = nbins))
 
   # Transfer entropy
   TE <- H_ytyt_1 + H_yt_1_x_lag - H_yt_1 - H_y_yt_1_x_lag
@@ -141,17 +195,23 @@ cal_transfer_entropy <- function(var1,var2,nbins,lower_qt,upper_qt,lag,cr = FALS
 # alpha: alpha level for significance inference (default=0.05)
 # nshuffle: number of shuffles to get critical TE values (default=300)
 # lower and upper quantiles to deal with outliers
-Cal_TE_main <- function(var1,var2,max_lag,nbins,alpha=0.05,nshuffle = 300,upper_qt,lower_qt){
+# ZFlag_Source is whether the Source needs zero adjustment (TURE or FALSE)
+# ZFlag_Sink is whether the Sink needs zero adjustment (TURE or FALSE)
+
+Cal_TE_main <- function(var1,var2,max_lag,nbins,alpha=0.05,nshuffle = 300,upper_qt,lower_qt,ZFlag_Source,ZFlag_Sink){
   # Calculate the total entropy for the whole sink variable
-  H_sink <- cal_entropy(table(zero_adjustment(var2,nbins,lower_qt,upper_qt)))
+  # Assuming H does not change largely across lags (this is to save computational time)
+  H_sink <- cal_entropy(table(zero_adjustment(var2,nbins,lower_qt,upper_qt,ZFlag_Sink)))
   
   # Compute lag-independent critical TE if needed
   if(!Lag_Dependent_Crit){
     # Shuffle-based null distribution of TE
     TE_shuffled_global <- replicate(nshuffle,{
-      cal_transfer_entropy(var1,var2,nbins,lower_qt,upper_qt,lag=0,cr=TRUE)
+      cal_transfer_entropy(var1,var2,nbins,lower_qt,upper_qt,lag=0,cr=TRUE,ZFlag_Source = ZFlag_Source,ZFlag_Sink = ZFlag_Sink)
     })
-    cr_TE_global <- quantile(TE_shuffled_global,1-alpha)
+    # Get critical TE based on T-statistics
+    t_crit <- qt(1-alpha,df = nshuffle - 1)
+    cr_TE_global <- mean(TE_shuffled_global,na.rm=TRUE) + t_crit*sd(TE_shuffled_global,na.rm=TRUE)
   }
   
   # Initialize a list to store all TE results
@@ -160,17 +220,18 @@ Cal_TE_main <- function(var1,var2,max_lag,nbins,alpha=0.05,nshuffle = 300,upper_
     p <- progressor(along = 0:max_lag)
     # Calculate TE across all lags
     future_lapply(0:max_lag, function(lag){
-      TE_results <- cal_transfer_entropy(var1,var2,nbins,lower_qt,upper_qt,lag)
+      TE_results <- cal_transfer_entropy(var1,var2,nbins,lower_qt,upper_qt,lag,ZFlag_Source = ZFlag_Source,ZFlag_Sink = ZFlag_Sink)
       
       # Get Lag-dependent TE
       if(Lag_Dependent_Crit){
         # Shuffle-based null distribution of TE
         TE_shuffled <- future_replicate(nshuffle,{
-          cal_transfer_entropy(var1,var2,nbins,lower_qt,upper_qt,lag,cr=TRUE)
+          cal_transfer_entropy(var1,var2,nbins,lower_qt,upper_qt,lag,cr=TRUE,ZFlag_Source = ZFlag_Source,ZFlag_Sink = ZFlag_Sink)
         })
         
-        # Critical TE, using quantile
-        cr_TE <- quantile(TE_shuffled,1-alpha)  
+        # Critical TE, using T-statistics
+        t_crit <- qt(1-alpha,nshuffle - 1)
+        cr_TE <- mean(TE_shuffled,na.rm=TRUE) + t_crit*sd(TE_shuffled,na.rm=TRUE)
       }else{
         cr_TE <- cr_TE_global
       }
