@@ -28,7 +28,7 @@ AMF_df <- read.csv(here("00_Data","AMF_test.csv"))
 # This is the results from python TE implementation
 SM_TE_df_py <- read.csv(here("02_TE_implementation","Results","TE_comparison_R_vs_python","AmerifluxTestSite_TEresults_python.csv"))
 # Output path for results and figures
-Output_path <- here("02_TE_implementation","Results/")
+Output_path <- here("02_TE_implementation","Results/TE_comparison_R_vs_python/")
 
 # Parameters for TE implementation
 nbin <- 11 # Number of bins for TE discritization of continuous data (e.g., SM)
@@ -63,10 +63,23 @@ SM_TE_df <- Cal_TE_main(var1 = AMF_df$SM,
 
 end_time <- Sys.time()
 print(end_time - start_time)
-# Record: running time (5 mins)
-g <- TE_lag_plot(SM_TE_df,"SM->ET","None")
+# Record: running time (3.4 mins)
+g_TE <- TE_lag_plot(SM_TE_df,"SM->ET","None")
+# Output this figure
+print_g(g_TE,"TE_SM_ET_daily_US-Ne1_test",6,4)
 
 # Compare R results with python results
-plot(SM_TE_df$TE[1:90],SM_TE_df_py$TE_bits)
-cor(SM_TE_df$TE[1:90],SM_TE_df_py$TE_bits)
+TE_df <- data.frame(TE_R = SM_TE_df$TE[1:90],
+                    TE_Py = SM_TE_df_py$TE_bits)
+# Calculate R2 between TE_R and TE_Py
+R2 <- round(summary(lm(data=TE_df,TE_Py~TE_R))$r.squared,2)
+g <- ggplot(TE_df,aes(TE_R,TE_Py))+
+  geom_point(size=2,color="grey",alpha=0.8)+
+  geom_abline(slope=1,intercept = 0,linetype="dashed")+
+  my_theme+
+  theme(aspect.ratio = 1:1)+
+  annotate("text",x=0.105,y=0.09,
+           label=paste("R2 =",R2),
+           size=6)
+print_g(g,"TE_comparison_R_vs_python",4,4)
 
