@@ -1,6 +1,9 @@
 # Author: Zhaozhe Chen (zhaozhe.chen@wisc.edu)
 # This code is to make plots
 
+library(ggplot2)
+library(cowplot)
+
 # Theme for all plots
 my_theme <- theme(
   #axis.line=element_line(color="black"),

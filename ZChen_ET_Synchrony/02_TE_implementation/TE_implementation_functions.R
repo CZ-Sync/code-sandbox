@@ -1,7 +1,14 @@
 # Author: Zhaozhe Chen (zhaozhe.chen@wisc.edu)
 # This code includes functions for TE implementation, and data processing before TE implementation
-
 # This code can handle with zero values. When discretizing continuous data, it puts zero values in the first bin
+
+library(here)
+library(dplyr)
+library(tidyr)
+library(future)
+library(future.apply)
+library(lubridate)
+library(progressr)
 
 # This function calculates the difference between each two time steps in a time series
 # Input df: the data frame of time series variables
@@ -14,6 +21,67 @@ delta_TS <- function(df,varname){
   # Get the difference
   delta_var <- TS1 - TS0
   return(delta_var)
+}
+
+# This function is to standardize time, when 00:00:00 is removed in Time
+# Input the dataframe, which should include a Time column as "YYYY-MM-DD hh:mm:ss"
+Standardize_time <- function(df){
+  # Convert Time to POSIXct Time
+  df <- df %>%
+    mutate(Time = if_else(
+      nchar(Time) == 10, # If it is YYYY-MM-DD
+      paste(Time,"00:00:00"),
+      Time
+    )) %>%
+    mutate(Time = ymd_hms(Time,tz="UTC")) %>%
+    # Extract hour of the day
+    mutate(Hour = hour(Time),
+           Date=as.Date(Time)) 
+}
+
+# This function calculates diurnal anomaly to remove diurnal cycles of TS
+# The anomaly signal is obtained by taking the difference between the values of a variable at a specific time of the day
+# From the average value over the following n days of the same variable at the same time, in the format of "YYYY-MM-DD hh:mm:ss"
+# This method follows (Ruddell and Kumar, 2009)
+# The input include:
+# df: Hourly scale data frame, including a column called Time
+# varname: The target variable name
+# windowdays: window size in days
+# Requires the package lubridate
+# Example: df <- read.csv(here("00_Data","AMF_hourly_test.csv"))
+# test <- Cal_diurnal_anomaly(df,"SWC",5)
+Cal_diurnal_anomaly <- function(df,varname,windowdays){
+  # Make sure the time is in the correct POSIXct format
+  df <- df %>%
+    mutate(Time = if_else(
+      nchar(Time) == 10, # If it is YYYY-MM-DD
+      paste(Time,"00:00:00"),
+      Time
+    )) %>%
+    mutate(Time = ymd_hms(Time,tz="UTC"))
+  
+  # Complete the full sequence of hourly time steps
+  # This is because there may be missing rows in the df
+  full_time <- data.frame(Time = seq(from = floor_date(min(df$Time),unit="day"),
+                                     to = ceiling_date(max(df$Time),unit="day"),
+                                     by="1 hour"))
+  # Merge with original df
+  df_full <- full_time %>%
+    left_join(df,by="Time")
+  
+  # Create shifted TS, each one leads the previous one by 24 hours
+  TS_shift <- sapply(0:(windowdays-1), function(i){
+    lead(df_full[[varname]],n=i*24)
+  })
+  
+  # Calculate row means (window means)
+  mean_window <- rowMeans(TS_shift,na.rm=TRUE)
+  # Get the anomaly
+  df_full[[paste0(varname,"_anomaly")]] <- df_full[[varname]] - mean_window
+  # Keep only the original rows
+  df_out <- df_full %>%
+    filter(Time %in% df$Time)
+  return(df_out)
 }
 
 # This function is to deal with outliers before discretization of continuous data
