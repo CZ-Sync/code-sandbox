@@ -34,6 +34,268 @@ require(ncdf4)
 #	Qxx
 
 
+process_gages_rawData <- function(gages_df, gage_type, min_num_years, start_date, end_date, 
+                          min_Q_value_and_days, basinAt_NorAm_polys, HB_dt, 
+                          upstream_hydrobasins, output_file) {
+  
+  # Check if output file exists; if so, read it with gage_id forced to character.
+  if (file.exists(output_file)) {
+    summary_output <- fread(output_file, colClasses = list(character = "gage_id"))
+    # Also force conversion in case some rows were stored as integer64.
+    summary_output[, gage_id := as.character(gage_id)]
+    cat("Loaded existing summary data with", nrow(summary_output), "rows\n")
+  } else {
+    summary_output <- data.table(
+      gage_id = character(),
+      latitude = numeric(),
+      longitude = numeric(),
+      basin_area = numeric(),
+      gage_type = character()
+    )
+    cat("Created new summary data table\n")
+    fwrite(summary_output, output_file)
+  }
+  
+  # Process each gage
+  for (i in 1:nrow(gages_df)) {
+    current_gage <- gages_df[i, ]
+    
+    # Extract gage ID and coordinate info based on gage type
+    if (gage_type == "USGS") {
+      gage_id <- as.character(current_gage$STAID)
+      latitude <- as.numeric(current_gage$LAT_GAGE)
+      longitude <- as.numeric(current_gage$LNG_GAGE)
+      basin_area <- as.numeric(current_gage$DRAIN_SQKM)
+    } else if (gage_type %in% c("Canada", "CANADIAN")) {
+      # Rename Canadian coordinate columns to match USGS convention
+      names(current_gage)[names(current_gage) == 'LATITUDE'] <- 'LAT_GAGE'
+      names(current_gage)[names(current_gage) == 'LONGITUDE'] <- 'LNG_GAGE'
+      gage_id <- as.character(current_gage$STATION_NUMBER)
+      latitude <- as.numeric(current_gage$LAT_GAGE)
+      longitude <- as.numeric(current_gage$LNG_GAGE)
+      basin_area <- NA
+    } else {
+      stop("Unsupported gage type")
+    }
+    
+    if (gage_id %in% summary_output$gage_id) {
+      cat("Skipping gage", gage_id, "as it's already in the output\n")
+      next
+    }
+    
+    cat("Processing gage", gage_id, "(", i, "of", nrow(gages_df), ")\n")
+    
+    tryCatch({
+      streamflow_data <- generate_streamflow_dt(current_gage, gage_type, 
+                                                min_num_years, start_date, end_date)
+      if (is.null(streamflow_data) || identical(streamflow_data, NA) ||
+          (is.data.frame(streamflow_data) && nrow(streamflow_data) == 0)) {
+        cat("No valid streamflow data for gage", gage_id, "\n")
+        next
+      }
+      if (!is.data.frame(streamflow_data)) {
+        cat("Invalid streamflow data format for gage", gage_id, "\n")
+        next
+      }
+      
+      # Try to add required columns if missing
+      required_cols <- c("year", "Q", "doy", "month")
+      if (!all(required_cols %in% colnames(streamflow_data))) {
+        if (!"year" %in% colnames(streamflow_data) && "Date" %in% colnames(streamflow_data)) {
+          streamflow_data$year <- year(streamflow_data$Date)
+        }
+        if (!"doy" %in% colnames(streamflow_data) && "Date" %in% colnames(streamflow_data)) {
+          streamflow_data$doy <- yday(streamflow_data$Date)
+        }
+        if (!"month" %in% colnames(streamflow_data) && "Date" %in% colnames(streamflow_data)) {
+          streamflow_data$month <- month(streamflow_data$Date)
+        }
+        if (!all(required_cols %in% colnames(streamflow_data))) {
+          cat("Missing required columns in streamflow data for gage", gage_id, "\n")
+          next
+        }
+      }
+      
+      # Apply min_Q_value_and_days filter
+      years_to_use <- NULL
+      for (this_year in unique(streamflow_data$year)) {
+        test_year <- subset(streamflow_data, year == this_year)
+        # Ensure Q is numeric for comparison
+        if(!is.numeric(test_year$Q)) test_year$Q <- as.numeric(test_year$Q)
+        
+        # Handle potential NAs in Q before comparison
+        valid_q_values <- test_year$Q[!is.na(test_year$Q)]
+        nonzero_rows <- which(valid_q_values > min_Q_value_and_days[1])
+        
+        if (length(nonzero_rows) >= min_Q_value_and_days[2]) {
+          years_to_use <- c(years_to_use, this_year)
+        }
+      }
+      
+      if (length(years_to_use) < min_num_years) {
+        cat("Insufficient years with valid data for gage", gage_id, "\n")
+        next
+      }
+      
+      streamflow_data_filtered <- streamflow_data[streamflow_data$year %in% years_to_use, ]
+      
+      if (nrow(streamflow_data_filtered) == 0) {
+        cat("No data remaining after year filtering for gage", gage_id, "\n")
+        next
+      }
+      
+      # Find upstream basins
+      upstream_basins <- NULL
+      num_upstream_basins <- NA
+      tryCatch({
+        upstream_basins <- find_upstream_hydrobasins(
+          current_gage = current_gage,
+          basinAt_NorAm_polys = basinAt_NorAm_polys,
+          HB_dt = HB_dt,
+          upstream_hydrobasins = upstream_hydrobasins,
+          save_path = file.path(dirname(output_file), "upstream_hydrobasins.RData")
+        )
+        if (!is.null(upstream_basins)) {
+          num_upstream_basins <- length(upstream_basins)
+        }
+      }, error = function(e) {
+        cat("Error finding upstream basins for gage", gage_id, ":", e$message, "\n")
+      })
+      
+      # Calculate all streamflow metrics
+      cat("Calculating metrics for gage", gage_id, "...\n")
+      
+      # Initialize empty metric results in case of errors
+      metrics_flow_vols <- NULL
+      metrics_fdc_trends <- NULL
+      metrics_flashiness <- NULL
+      metrics_flow_timing <- NULL
+      metrics_pulses <- NULL
+      metrics_baseflow <- NULL
+      metrics_recession <- NULL
+      
+      
+      # Calculate each metric with error handling
+      tryCatch({
+        metrics_flow_vols <- calculate_flow_vols_by_year(streamflow_data_filtered)
+      }, error = function(e) {
+        cat("Error calculating flow volumes for gage", gage_id, ":", e$message, "\n")
+      })
+      
+      tryCatch({
+        metrics_fdc_trends <- analyze_fdc_trends_from_streamflow(streamflow_data_filtered)
+      }, error = function(e) {
+        cat("Error calculating FDC trends for gage", gage_id, ":", e$message, "\n")
+      })
+      
+      tryCatch({
+        metrics_flashiness <- analyze_flashiness_trends(streamflow_data_filtered)
+      }, error = function(e) {
+        cat("Error calculating flashiness for gage", gage_id, ":", e$message, "\n")
+      })
+      
+      tryCatch({
+        metrics_flow_timing <- analyze_flow_timing_trends(streamflow_data_filtered)
+      }, error = function(e) {
+        cat("Error calculating flow timing for gage", gage_id, ":", e$message, "\n")
+      })
+      
+      tryCatch({
+        metrics_pulses <- calculate_pulse_metrics(streamflow_data_filtered)
+      }, error = function(e) {
+        cat("Error calculating pulse metrics for gage", gage_id, ":", e$message, "\n")
+      })
+      
+      tryCatch({
+        metrics_baseflow <- analyze_baseflow_indices(streamflow_data_filtered)
+      }, error = function(e) {
+        cat("Error calculating baseflow indices for gage", gage_id, ":", e$message, "\n")
+      })
+      
+      tryCatch({
+        metrics_recession <- analyze_recession_parameters(streamflow_data_filtered)
+      }, error = function(e) {
+        cat("Error calculating recession indices for gage", gage_id, ":", e$message, "\n")
+      })
+      
+      
+      # Note: We skip analyze_Q_PPT_relationships() for USGS/Canadian gages 
+      # because PPT data is not available in the current data retrieval setup
+      
+      # Create a row for this gage with base information
+      gage_row <- data.table(
+        gage_id = gage_id,
+        latitude = latitude,
+        longitude = longitude,
+        basin_area = basin_area,
+        gage_type = gage_type,
+        num_years = length(years_to_use),
+        start_year = min(years_to_use),
+        end_year = max(years_to_use),
+        num_upstream_basins = num_upstream_basins
+      )
+      
+      # Combine base gage info with calculated metrics
+      # Only add metrics that were successfully calculated
+      if (!is.null(metrics_flow_vols)) {
+        gage_row <- cbind(gage_row, as.data.table(metrics_flow_vols))
+      }
+      if (!is.null(metrics_fdc_trends)) {
+        gage_row <- cbind(gage_row, as.data.table(metrics_fdc_trends))
+      }
+      if (!is.null(metrics_flashiness)) {
+        gage_row <- cbind(gage_row, as.data.table(metrics_flashiness))
+      }
+      if (!is.null(metrics_flow_timing)) {
+        gage_row <- cbind(gage_row, as.data.table(metrics_flow_timing))
+      }
+      if (!is.null(metrics_pulses)) {
+        gage_row <- cbind(gage_row, as.data.table(metrics_pulses))
+      }
+      if (!is.null(metrics_baseflow)) {
+        gage_row <- cbind(gage_row, as.data.table(metrics_baseflow))
+      }
+      if (!is.null(metrics_recession)) {
+        gage_row <- cbind(gage_row, as.data.table(metrics_recession))
+      }
+      # Add NA columns for Q-PPT metrics that we can't calculate
+      q_ppt_cols <- c("annual_runoff_ratio_slp", "annual_runoff_ratio_rho", 
+                      "annual_runoff_ratio_pval", "annual_runoff_ratio_mean", 
+                      "annual_runoff_ratio_median",
+                      "winter_runoff_ratio_slp", "winter_runoff_ratio_rho", 
+                      "winter_runoff_ratio_pval", "winter_runoff_ratio_mean", 
+                      "winter_runoff_ratio_median",
+                      "spring_runoff_ratio_slp", "spring_runoff_ratio_rho", 
+                      "spring_runoff_ratio_pval", "spring_runoff_ratio_mean", 
+                      "spring_runoff_ratio_median",
+                      "summer_runoff_ratio_slp", "summer_runoff_ratio_rho", 
+                      "summer_runoff_ratio_pval", "summer_runoff_ratio_mean", 
+                      "summer_runoff_ratio_median",
+                      "fall_runoff_ratio_slp", "fall_runoff_ratio_rho", 
+                      "fall_runoff_ratio_pval", "fall_runoff_ratio_mean", 
+                      "fall_runoff_ratio_median")
+      
+      for (col in q_ppt_cols) {
+        gage_row[[col]] <- NA_real_
+      }
+      
+      # Append to summary output
+      summary_output <- rbind(summary_output, gage_row, fill = TRUE)
+      
+      # Save after each successful processing
+      fwrite(summary_output, output_file)
+      cat("Successfully processed gage", gage_id, "\n")
+      
+    }, error = function(e) {
+      cat("Error processing gage", gage_id, ":", e$message, "\n")
+    })
+  }
+  
+  cat("Finished processing all gages. Final summary has", nrow(summary_output), "rows\n")
+  return(summary_output)
+}
+
+
 
 
 process_gages <- function(gages_df, gage_type, min_num_years, start_date, end_date, 
@@ -353,7 +615,7 @@ calculate_flow_vols_by_year = function(streamflow_data){
   colnames(result) <- paste0(rep(periods, each=length(stats)), "_", rep(stats, times=length(periods)))
   
   # Calculate annual means
-  annual_means <- aggregate(Q ~ year, data=streamflow_data, FUN=mean, na.rm=TRUE)
+  annual_means <- aggregate(Q ~ year, data=streamflow_data, FUN=sum, na.rm=TRUE)
   
   # Calculate seasonal means
   winter <- streamflow_data[streamflow_data$month %in% c(12, 1, 2), ]
@@ -361,10 +623,10 @@ calculate_flow_vols_by_year = function(streamflow_data){
   summer <- streamflow_data[streamflow_data$month %in% c(6, 7, 8), ]
   fall <- streamflow_data[streamflow_data$month %in% c(9, 10, 11), ]
   
-  winter_means <- aggregate(Q ~ year, data=winter, FUN=mean, na.rm=TRUE)
-  spring_means <- aggregate(Q ~ year, data=spring, FUN=mean, na.rm=TRUE)
-  summer_means <- aggregate(Q ~ year, data=summer, FUN=mean, na.rm=TRUE)
-  fall_means <- aggregate(Q ~ year, data=fall, FUN=mean, na.rm=TRUE)
+  winter_means <- aggregate(Q ~ year, data=winter, FUN=sum, na.rm=TRUE)
+  spring_means <- aggregate(Q ~ year, data=spring, FUN=sum, na.rm=TRUE)
+  summer_means <- aggregate(Q ~ year, data=summer, FUN=sum, na.rm=TRUE)
+  fall_means <- aggregate(Q ~ year, data=fall, FUN=sum, na.rm=TRUE)
   
   # Calculate flow percentiles by year
   calculate_percentile <- function(data, percentile) {
@@ -746,9 +1008,14 @@ analyze_flow_timing_trends <- function(streamflow_data) {
   # Initialize results data frame
   percentiles <- c(5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95)
   
-  # Add historical_avg to col_types
+  # Add the two new signatures
+  additional_sigs <- c("D25_to_D75", "Dmax")
+  
   col_types <- c("slp", "rho", "pval", "mean", "median")
-  result <- data.frame(matrix(NA, nrow=1, ncol=length(percentiles)*length(col_types)))
+  
+  # Calculate total number of columns
+  total_cols <- (length(percentiles) + length(additional_sigs)) * length(col_types)
+  result <- data.frame(matrix(NA, nrow=1, ncol=total_cols))
   
   # Set column names
   col_names <- c()
@@ -757,11 +1024,21 @@ analyze_flow_timing_trends <- function(streamflow_data) {
       col_names <- c(col_names, paste0("D", p, "_day_", type))
     }
   }
+  # Add column names for additional signatures
+  for (sig in additional_sigs) {
+    for (type in col_types) {
+      col_names <- c(col_names, paste0(sig, "_", type))
+    }
+  }
   colnames(result) <- col_names
   
   # Create a data frame to store Julian days when cumulative flow reaches each percentile
   years <- unique(streamflow_data$year)
   julday_max <- data.frame(year=years)
+  
+  # Initialize columns for D25_to_D75 and Dmax
+  julday_max$D25_to_D75 <- NA
+  julday_max$Dmax <- NA
   
   # For each year, find the day when cumulative flow reaches each percentile threshold
   for (yr in years) {
@@ -802,9 +1079,26 @@ analyze_flow_timing_trends <- function(streamflow_data) {
         julday_max[julday_max$year == yr, paste0("D", p, "_day")] <- NA
       }
     }
+    
+    # Calculate D25_to_D75 (days between 25% and 75% cumulative flow)
+    # Find days for 25% and 75%
+    above_25 <- which(year_data$cum_pct >= 25)
+    above_75 <- which(year_data$cum_pct >= 75)
+    
+    if (length(above_25) > 0 && length(above_75) > 0) {
+      day_25 <- year_data$doy[above_25[1]]
+      day_75 <- year_data$doy[above_75[1]]
+      julday_max[julday_max$year == yr, "D25_to_D75"] <- day_75 - day_25
+    }
+    
+    # Calculate Dmax (day of maximum discharge)
+    max_Q_idx <- which.max(year_data$Q)
+    if (length(max_Q_idx) > 0) {
+      julday_max[julday_max$year == yr, "Dmax"] <- year_data$doy[max_Q_idx]
+    }
   }
   
-  # Calculate trends and historical averages for each percentile
+  # Calculate trends and statistics for each percentile
   for (p in percentiles) {
     day_col <- paste0("D", p, "_day")
     
@@ -819,7 +1113,7 @@ analyze_flow_timing_trends <- function(streamflow_data) {
       # Calculate Spearman correlation
       day_spearmans <- cor.test(valid_data$year, valid_data[[day_col]], method='spearman')
       
-      # Calculate historical average (mean rounded to nearest integer)
+      # Calculate mean and median
       day_mean <- round(mean(valid_data[[day_col]], na.rm=TRUE))
       day_median <- round(median(valid_data[[day_col]], na.rm=TRUE))
       
@@ -832,6 +1126,50 @@ analyze_flow_timing_trends <- function(streamflow_data) {
     }
   }
   
+  # Calculate trends and statistics for D25_to_D75
+  valid_data_d25_75 <- subset(julday_max, !is.na(julday_max$D25_to_D75))
+  
+  if (nrow(valid_data_d25_75) > 2) {
+    # Calculate Sen's slope
+    d25_75_mod <- zyp::zyp.sen(D25_to_D75 ~ year, valid_data_d25_75)
+    
+    # Calculate Spearman correlation
+    d25_75_spearmans <- cor.test(valid_data_d25_75$year, valid_data_d25_75$D25_to_D75, method='spearman')
+    
+    # Calculate mean and median
+    d25_75_mean <- round(mean(valid_data_d25_75$D25_to_D75, na.rm=TRUE))
+    d25_75_median <- round(median(valid_data_d25_75$D25_to_D75, na.rm=TRUE))
+    
+    # Store results
+    result[["D25_to_D75_slp"]] <- d25_75_mod$coef[2]
+    result[["D25_to_D75_rho"]] <- d25_75_spearmans$estimate
+    result[["D25_to_D75_pval"]] <- d25_75_spearmans$p.value
+    result[["D25_to_D75_mean"]] <- d25_75_mean
+    result[["D25_to_D75_median"]] <- d25_75_median
+  }
+  
+  # Calculate trends and statistics for Dmax
+  valid_data_dmax <- subset(julday_max, !is.na(julday_max$Dmax))
+  
+  if (nrow(valid_data_dmax) > 2) {
+    # Calculate Sen's slope
+    dmax_mod <- zyp::zyp.sen(Dmax ~ year, valid_data_dmax)
+    
+    # Calculate Spearman correlation
+    dmax_spearmans <- cor.test(valid_data_dmax$year, valid_data_dmax$Dmax, method='spearman')
+    
+    # Calculate mean and median
+    dmax_mean <- round(mean(valid_data_dmax$Dmax, na.rm=TRUE))
+    dmax_median <- round(median(valid_data_dmax$Dmax, na.rm=TRUE))
+    
+    # Store results
+    result[["Dmax_slp"]] <- dmax_mod$coef[2]
+    result[["Dmax_rho"]] <- dmax_spearmans$estimate
+    result[["Dmax_pval"]] <- dmax_spearmans$p.value
+    result[["Dmax_mean"]] <- dmax_mean
+    result[["Dmax_median"]] <- dmax_median
+  }
+  
   # Add julday_max as an attribute to the result
   attr(result, "julday_max") <- julday_max
   
@@ -842,67 +1180,9 @@ analyze_flow_timing_trends <- function(streamflow_data) {
 
 
 
-calculate_median_flow_dates <- function(streamflow_data) {
-  # Check if required columns exist
-  required_cols <- c("year", "Q", "doy")
-  if (!all(required_cols %in% colnames(streamflow_data))) {
-    missing <- required_cols[!required_cols %in% colnames(streamflow_data)]
-    stop(paste("Missing required columns:", paste(missing, collapse=", ")))
-  }
-  
-  # Initialize results data frame
-  result <- data.frame(matrix(NA, nrow=1, ncol=11))
-  
-  # Set column names for percentiles 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95
-  percentiles <- c(5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95)
-  colnames(result) <- paste0("D", percentiles, "_med_date")
-  
-  # Calculate flow percentiles for the entire dataset
-  flow_percentiles <- quantile(streamflow_data$Q, probs=percentiles/100, na.rm=TRUE)
-  
-  # Create a data frame to store Julian days when flow drops below each percentile
-  julday_max <- data.frame(year=unique(streamflow_data$year))
-  
-  # For each year, find the day when flow drops below each percentile threshold
-  for (yr in unique(streamflow_data$year)) {
-    year_data <- streamflow_data[streamflow_data$year == yr, ]
-    
-    # Sort by day of year to ensure chronological order
-    year_data <- year_data[order(year_data$doy), ]
-    
-    # For each percentile, find the first day when flow drops below the threshold
-    for (p in percentiles) {
-      threshold <- flow_percentiles[as.character(p/100)]
-      
-      # Find days where flow is below the threshold
-      below_threshold <- which(year_data$Q <= threshold)
-      
-      # If there are days below threshold, take the first one
-      if (length(below_threshold) > 0) {
-        julday_max[julday_max$year == yr, paste0("D", p, "_day")] <- 
-          year_data$doy[below_threshold[1]]
-      } else {
-        julday_max[julday_max$year == yr, paste0("D", p, "_day")] <- NA
-      }
-    }
-  }
-  
-  # Calculate median dates for each percentile
-  for (p in percentiles) {
-    col_name <- paste0("D", p, "_day")
-    result_col <- paste0("D", p, "_med_date")
-    
-    result[1, result_col] <- median(julday_max[[col_name]], na.rm=TRUE)
-  }
-  
-  return(result)
-}
-
-
-
 calculate_pulse_metrics <- function(streamflow_data) {
   # Check if required columns exist
-  required_cols <- c("year", "Q", "doy")
+  required_cols <- c("year", "Q", "doy", "month")
   if (!all(required_cols %in% colnames(streamflow_data))) {
     missing <- required_cols[!required_cols %in% colnames(streamflow_data)]
     stop(paste("Missing required columns:", paste(missing, collapse=", ")))
@@ -928,7 +1208,13 @@ calculate_pulse_metrics <- function(streamflow_data) {
     dur_high_pulses_year = NA,
     dur_low_pulses_year = NA,
     dur_high_pulses_all = NA,
-    dur_low_pulses_all = NA
+    dur_low_pulses_all = NA,
+    TQmean = NA,
+    Flow_Reversals_annual = NA,
+    Flow_Reversals_winter = NA,
+    Flow_Reversals_spring = NA,
+    Flow_Reversals_summer = NA,
+    Flow_Reversals_fall = NA
   )
   
   # Function to identify pulses (consecutive days above/below threshold)
@@ -964,6 +1250,40 @@ calculate_pulse_metrics <- function(streamflow_data) {
     }
   }
   
+  # Function to count flow reversals
+  count_flow_reversals <- function(flow_vector, threshold_pct = 0.02) {
+    # Remove NAs
+    flow_clean <- flow_vector[!is.na(flow_vector)]
+    n <- length(flow_clean)
+    
+    if (n < 3) return(0)
+    
+    reversal_count <- 0
+    
+    for (i in 2:(n-1)) {
+      # Calculate changes
+      prev_change <- flow_clean[i] - flow_clean[i-1]
+      next_change <- flow_clean[i+1] - flow_clean[i]
+      
+      # Check if change exceeds threshold (2% of current flow)
+      threshold <- abs(threshold_pct * flow_clean[i])
+      
+      # Check for reversal: increasing to decreasing or decreasing to increasing
+      if (abs(next_change) > threshold) {
+        # Was increasing (or flat), now decreasing
+        if (prev_change >= 0 && next_change < 0) {
+          reversal_count <- reversal_count + 1
+        }
+        # Was decreasing (or flat), now increasing
+        else if (prev_change <= 0 && next_change > 0) {
+          reversal_count <- reversal_count + 1
+        }
+      }
+    }
+    
+    return(reversal_count)
+  }
+  
   # Process each year
   for (yr in years) {
     year_data <- streamflow_data[streamflow_data$year == yr, ]
@@ -993,6 +1313,26 @@ calculate_pulse_metrics <- function(streamflow_data) {
     high_pulses_all <- identify_pulses(year_data$Q, q90_all, above = TRUE)
     low_pulses_all <- identify_pulses(year_data$Q, q10_all, above = FALSE)
     
+    # Calculate TQmean
+    annual_mean_flow <- mean(year_data$Q, na.rm = TRUE)
+    days_above_mean <- sum(year_data$Q > annual_mean_flow, na.rm = TRUE)
+    total_days <- sum(!is.na(year_data$Q))
+    tqmean_pct <- (days_above_mean / total_days) * 100
+    
+    # Calculate annual flow reversals
+    annual_reversals <- count_flow_reversals(year_data$Q)
+    
+    # Calculate seasonal flow reversals
+    winter_data <- year_data[year_data$month %in% c(12, 1, 2), ]
+    spring_data <- year_data[year_data$month %in% c(3, 4, 5), ]
+    summer_data <- year_data[year_data$month %in% c(6, 7, 8), ]
+    fall_data <- year_data[year_data$month %in% c(9, 10, 11), ]
+    
+    winter_reversals <- if(nrow(winter_data) >= 30) count_flow_reversals(winter_data$Q) else NA
+    spring_reversals <- if(nrow(spring_data) >= 30) count_flow_reversals(spring_data$Q) else NA
+    summer_reversals <- if(nrow(summer_data) >= 30) count_flow_reversals(summer_data$Q) else NA
+    fall_reversals <- if(nrow(fall_data) >= 30) count_flow_reversals(fall_data$Q) else NA
+    
     # Store results
     idx <- which(pulse_metrics$year == yr)
     pulse_metrics$n_high_pulses_year[idx] <- high_pulses_year$n_pulses
@@ -1003,13 +1343,22 @@ calculate_pulse_metrics <- function(streamflow_data) {
     pulse_metrics$dur_low_pulses_year[idx] <- low_pulses_year$mean_duration
     pulse_metrics$dur_high_pulses_all[idx] <- high_pulses_all$mean_duration
     pulse_metrics$dur_low_pulses_all[idx] <- low_pulses_all$mean_duration
+    pulse_metrics$TQmean[idx] <- tqmean_pct
+    pulse_metrics$Flow_Reversals_annual[idx] <- annual_reversals
+    pulse_metrics$Flow_Reversals_winter[idx] <- winter_reversals
+    pulse_metrics$Flow_Reversals_spring[idx] <- spring_reversals
+    pulse_metrics$Flow_Reversals_summer[idx] <- summer_reversals
+    pulse_metrics$Flow_Reversals_fall[idx] <- fall_reversals
   }
   
   # Define signature names
   signatures <- c("n_high_pulses_year", "n_low_pulses_year", 
                   "n_high_pulses_all", "n_low_pulses_all",
                   "dur_high_pulses_year", "dur_low_pulses_year", 
-                  "dur_high_pulses_all", "dur_low_pulses_all")
+                  "dur_high_pulses_all", "dur_low_pulses_all",
+                  "TQmean", "Flow_Reversals_annual",
+                  "Flow_Reversals_winter", "Flow_Reversals_spring",
+                  "Flow_Reversals_summer", "Flow_Reversals_fall")
   
   stats <- c("slp", "rho", "pval", "mean", "median")
   
@@ -1073,6 +1422,8 @@ calculate_pulse_metrics <- function(streamflow_data) {
   
   return(result)
 }
+
+
 
 
 analyze_Q_PPT_relationships <- function(streamflow_data) {
@@ -1203,6 +1554,640 @@ analyze_Q_PPT_relationships <- function(streamflow_data) {
     summer = summer_totals,
     fall = fall_totals
   )
+  
+  return(result)
+}
+
+
+
+
+analyze_baseflow_indices <- function(streamflow_data) {
+  # Check if required columns exist
+  required_cols <- c("year", "Q", "doy")
+  if (!all(required_cols %in% colnames(streamflow_data))) {
+    missing <- required_cols[!required_cols %in% colnames(streamflow_data)]
+    stop(paste("Missing required columns:", paste(missing, collapse=", ")))
+  }
+  
+  # Check if zyp package is available
+  if (!requireNamespace("zyp", quietly = TRUE)) {
+    stop("Package 'zyp' is needed for this function. Please install it with install.packages('zyp')")
+  }
+  
+  # Define signatures and stats
+  signatures <- c("BFI_Eckhardt", "BFI_LyneHollick")
+  stats <- c("slp", "rho", "pval", "mean", "median")
+  
+  # Initialize results data frame
+  result <- data.frame(matrix(NA, nrow=1, ncol=length(signatures)*length(stats)))
+  colnames(result) <- paste0(rep(signatures, each=length(stats)), "_", rep(stats, times=length(signatures)))
+  
+  # Function to apply Eckhardt filter
+  eckhardt_filter <- function(Q, BFImax = 0.8, a = 0.98) {
+    n <- length(Q)
+    baseflow <- numeric(n)
+    baseflow[1] <- Q[1] * BFImax  # Initialize with fraction of first flow
+    
+    for (i in 2:n) {
+      if (!is.na(Q[i]) && !is.na(Q[i-1]) && !is.na(baseflow[i-1])) {
+        # Eckhardt filter equation
+        numerator <- (1 - BFImax) * a * baseflow[i-1] + (1 - a) * BFImax * Q[i]
+        denominator <- 1 - a * BFImax
+        baseflow[i] <- numerator / denominator
+        
+        # Baseflow cannot exceed total flow
+        baseflow[i] <- min(baseflow[i], Q[i])
+        # Baseflow cannot be negative
+        baseflow[i] <- max(baseflow[i], 0)
+      } else {
+        baseflow[i] <- NA
+      }
+    }
+    
+    return(baseflow)
+  }
+  
+  # Function to apply Lyne-Hollick filter
+  lyne_hollick_filter <- function(Q, alpha = 0.925, passes = 2) {
+    n <- length(Q)
+    
+    # Apply filter in forward and backward directions for specified passes
+    quickflow <- Q
+    
+    for (pass in 1:passes) {
+      # Forward pass
+      qf_forward <- numeric(n)
+      qf_forward[1] <- 0
+      
+      for (i in 2:n) {
+        if (!is.na(Q[i]) && !is.na(Q[i-1]) && !is.na(qf_forward[i-1])) {
+          qf_forward[i] <- alpha * qf_forward[i-1] + ((1 + alpha) / 2) * (Q[i] - Q[i-1])
+          # Constrain quickflow
+          qf_forward[i] <- max(0, min(qf_forward[i], Q[i]))
+        } else {
+          qf_forward[i] <- NA
+        }
+      }
+      
+      # Backward pass
+      qf_backward <- numeric(n)
+      qf_backward[n] <- qf_forward[n]
+      
+      for (i in (n-1):1) {
+        if (!is.na(qf_forward[i]) && !is.na(qf_forward[i+1]) && !is.na(qf_backward[i+1])) {
+          qf_backward[i] <- alpha * qf_backward[i+1] + ((1 + alpha) / 2) * (qf_forward[i] - qf_forward[i+1])
+          # Constrain quickflow
+          qf_backward[i] <- max(0, min(qf_backward[i], Q[i]))
+        } else {
+          qf_backward[i] <- NA
+        }
+      }
+      
+      quickflow <- qf_backward
+    }
+    
+    # Calculate baseflow as total flow minus quickflow
+    baseflow <- Q - quickflow
+    baseflow[baseflow < 0] <- 0
+    baseflow[is.na(Q)] <- NA
+    
+    return(baseflow)
+  }
+  
+  # Initialize data frame to store annual BFI values
+  years <- unique(streamflow_data$year)
+  bfi_by_year <- data.frame(
+    year = years,
+    BFI_Eckhardt = NA,
+    BFI_LyneHollick = NA
+  )
+  
+  # Process each year
+  for (yr in years) {
+    year_data <- streamflow_data[streamflow_data$year == yr, ]
+    
+    # Skip years with insufficient data
+    if (nrow(year_data) < 250) {
+      next
+    }
+    
+    # Sort by day of year to ensure chronological order
+    year_data <- year_data[order(year_data$doy), ]
+    
+    # Get streamflow values
+    Q <- year_data$Q
+    
+    # Skip if too many missing values
+    if (sum(is.na(Q)) / length(Q) > 0.2) {
+      next
+    }
+    
+    # Apply Eckhardt filter
+    baseflow_eckhardt <- eckhardt_filter(Q)
+    
+    # Apply Lyne-Hollick filter
+    baseflow_lyne <- lyne_hollick_filter(Q)
+    
+    # Calculate annual totals and BFI
+    total_flow <- sum(Q, na.rm = TRUE)
+    
+    if (total_flow > 0) {
+      # Eckhardt BFI
+      total_baseflow_eckhardt <- sum(baseflow_eckhardt, na.rm = TRUE)
+      bfi_eckhardt <- total_baseflow_eckhardt / total_flow
+      bfi_by_year$BFI_Eckhardt[bfi_by_year$year == yr] <- bfi_eckhardt
+      
+      # Lyne-Hollick BFI
+      total_baseflow_lyne <- sum(baseflow_lyne, na.rm = TRUE)
+      bfi_lyne <- total_baseflow_lyne / total_flow
+      bfi_by_year$BFI_LyneHollick[bfi_by_year$year == yr] <- bfi_lyne
+    }
+  }
+  
+  # Function to calculate trend statistics
+  calculate_trend_stats <- function(data, value_col) {
+    # Remove NA values
+    valid_data <- data[!is.na(data[[value_col]]), ]
+    
+    if (nrow(valid_data) < 3) {
+      return(list(slp = NA, estimate = NA, p.value = NA, 
+                  mean_val = NA, median_val = NA))
+    }
+    
+    # Create formula for Sen slope
+    formula <- as.formula(paste(value_col, "~ year"))
+    
+    # Theil-Sen slope using zyp
+    sen_mod <- try(zyp::zyp.sen(formula, data=valid_data), silent=TRUE)
+    if (inherits(sen_mod, "try-error")) {
+      sen_slope <- NA
+    } else {
+      sen_slope <- sen_mod$coeff[2]  # slope is the second coefficient
+    }
+    
+    # Spearman correlation
+    spearmans <- try(cor.test(valid_data$year, valid_data[[value_col]], method="spearman"), silent=TRUE)
+    if (inherits(spearmans, "try-error")) {
+      spearmans <- list(estimate = NA, p.value = NA)
+    }
+    
+    # Calculate mean and median
+    mean_val <- mean(valid_data[[value_col]], na.rm=TRUE)
+    median_val <- median(valid_data[[value_col]], na.rm=TRUE)
+    
+    return(list(
+      slp = sen_slope,
+      estimate = spearmans$estimate,
+      p.value = spearmans$p.value,
+      mean_val = mean_val,
+      median_val = median_val
+    ))
+  }
+  
+  # Calculate trend statistics for each BFI method
+  for (sig in signatures) {
+    # Convert signature name to match column name in bfi_by_year
+    col_name <- gsub("-", "", sig)  # Remove hyphen if any
+    trend_stats <- calculate_trend_stats(bfi_by_year, col_name)
+    
+    result[[paste0(sig, "_slp")]] <- trend_stats$slp
+    result[[paste0(sig, "_rho")]] <- trend_stats$estimate
+    result[[paste0(sig, "_pval")]] <- trend_stats$p.value
+    result[[paste0(sig, "_mean")]] <- trend_stats$mean_val
+    result[[paste0(sig, "_median")]] <- trend_stats$median_val
+  }
+  
+  # Add bfi_by_year as an attribute to the result
+  attr(result, "bfi_by_year") <- bfi_by_year
+  
+  return(result)
+}
+
+
+
+analyze_recession_parameters <- function(streamflow_data) {
+  # Check if required columns exist
+  required_cols <- c("year", "Q", "doy")
+  if (!all(required_cols %in% colnames(streamflow_data))) {
+    missing <- required_cols[!required_cols %in% colnames(streamflow_data)]
+    stop(paste("Missing required columns:", paste(missing, collapse=", ")))
+  }
+  
+  # Check if zyp package is available
+  if (!requireNamespace("zyp", quietly = TRUE)) {
+    stop("Package 'zyp' is needed for this function. Please install it with install.packages('zyp')")
+  }
+  
+  # Define signatures that will have standard stats
+  # Note: now using log_a instead of a
+  signatures_with_stats <- c("log_a_pointcloud", "log_a_events", "b_pointcloud", "b_events", "concavity")
+  stats <- c("slp", "rho", "pval", "mean", "median")
+  
+  # Define seasonality signatures (these will only have values, no stats)
+  seasonality_signatures <- c("log_a_seasonality_amplitude_all", "log_a_seasonality_minimum_all",
+                              "log_a_seasonality_amplitude_first_half", "log_a_seasonality_minimum_first_half",
+                              "log_a_seasonality_amplitude_last_half", "log_a_seasonality_minimum_last_half")
+  
+  # Initialize results data frame
+  n_cols <- length(signatures_with_stats) * length(stats) + length(seasonality_signatures)
+  result <- data.frame(matrix(NA, nrow=1, ncol=n_cols))
+  
+  # Set column names
+  col_names <- c()
+  # Add columns for signatures with stats
+  for (sig in signatures_with_stats) {
+    for (stat in stats) {
+      col_names <- c(col_names, paste0(sig, "_", stat))
+    }
+  }
+  # Add columns for seasonality signatures (no stats)
+  col_names <- c(col_names, seasonality_signatures)
+  colnames(result) <- col_names
+  
+  # Function to identify recession events (unchanged)
+  identify_recession_events <- function(Q_vector, min_length = 5) {
+    n <- length(Q_vector)
+    if (n < min_length + 1) return(list())
+    
+    # Calculate dQ/dt (using forward difference)
+    dQ_dt <- c(diff(Q_vector), NA)
+    
+    # Initialize list to store recession events
+    recession_events <- list()
+    
+    # Track current recession
+    in_recession <- FALSE
+    start_idx <- NA
+    
+    for (i in 1:(n-min_length)) {
+      # Check if we have valid data
+      if (is.na(Q_vector[i]) || is.na(dQ_dt[i])) {
+        if (in_recession) {
+          # End current recession if we hit NA
+          if (!is.na(start_idx) && (i - start_idx) >= min_length) {
+            recession_events[[length(recession_events) + 1]] <- list(
+              start = start_idx,
+              end = i - 1,
+              indices = start_idx:(i-1)
+            )
+          }
+          in_recession <- FALSE
+          start_idx <- NA
+        }
+        next
+      }
+      
+      # Check for monotonic decrease in both Q and |dQ/dt|
+      if (i < n - 1) {
+        # Need at least min_length consecutive days
+        is_recession <- TRUE
+        
+        # Check next min_length days
+        for (j in 0:(min_length-2)) {
+          if (i+j+1 > n || is.na(Q_vector[i+j]) || is.na(Q_vector[i+j+1]) || 
+              is.na(dQ_dt[i+j]) || is.na(dQ_dt[i+j+1])) {
+            is_recession <- FALSE
+            break
+          }
+          
+          # Check if Q is decreasing
+          if (Q_vector[i+j+1] >= Q_vector[i+j]) {
+            is_recession <- FALSE
+            break
+          }
+          
+          # Check if |dQ/dt| is decreasing (becoming less negative)
+          if (abs(dQ_dt[i+j+1]) >= abs(dQ_dt[i+j])) {
+            is_recession <- FALSE
+            break
+          }
+        }
+        
+        if (is_recession && !in_recession) {
+          # Start new recession
+          in_recession <- TRUE
+          start_idx <- i
+        } else if (!is_recession && in_recession) {
+          # End current recession
+          if (!is.na(start_idx) && (i - start_idx) >= min_length) {
+            recession_events[[length(recession_events) + 1]] <- list(
+              start = start_idx,
+              end = i - 1,
+              indices = start_idx:(i-1)
+            )
+          }
+          in_recession <- FALSE
+          start_idx <- NA
+        }
+      }
+    }
+    
+    # Check if we ended in a recession
+    if (in_recession && !is.na(start_idx) && (n - start_idx) >= min_length) {
+      recession_events[[length(recession_events) + 1]] <- list(
+        start = start_idx,
+        end = n,
+        indices = start_idx:n
+      )
+    }
+    
+    return(recession_events)
+  }
+  
+  # Function to fit recession parameters for a single event (now returning log_a)
+  fit_recession_event <- function(Q_values, remove_first_day = TRUE) {
+    if (remove_first_day && length(Q_values) > 1) {
+      Q_values <- Q_values[-1]
+    }
+    
+    n <- length(Q_values)
+    if (n < 3) return(list(log_a = NA, b = NA))
+    
+    # Calculate -dQ/dt
+    dQ_dt <- -diff(Q_values)
+    Q_subset <- Q_values[-length(Q_values)]
+    
+    # Remove any non-positive values for log transformation
+    valid_idx <- which(Q_subset > 0 & dQ_dt > 0)
+    if (length(valid_idx) < 2) return(list(log_a = NA, b = NA))
+    
+    Q_valid <- Q_subset[valid_idx]
+    dQ_dt_valid <- dQ_dt[valid_idx]
+    
+    # Fit in log-log space: log(-dQ/dt) = log(a) + b*log(Q)
+    tryCatch({
+      fit <- lm(log(dQ_dt_valid) ~ log(Q_valid))
+      b_est <- coef(fit)[2]
+      log_a_est <- coef(fit)[1]  # This is already log(a)
+      
+      return(list(log_a = log_a_est, b = b_est))
+    }, error = function(e) {
+      return(list(log_a = NA, b = NA))
+    })
+  }
+  
+  # Function to fit sinusoidal model to log(a) values
+  fit_sinusoidal_model <- function(doy_values, log_a_values) {
+    # Remove NA values
+    valid_idx <- which(!is.na(log_a_values) & !is.na(doy_values))
+    if (length(valid_idx) < 10) {
+      return(list(amplitude = NA, minimum_doy = NA))
+    }
+    
+    doy_clean <- doy_values[valid_idx]
+    log_a_clean <- log_a_values[valid_idx]
+    
+    # Fit sinusoidal model: log(a) = A * sin(2π/365 * (doy - φ)) + C
+    tryCatch({
+      # Create design matrix
+      X <- cbind(
+        sin(2 * pi * doy_clean / 365),
+        cos(2 * pi * doy_clean / 365),
+        1  # intercept
+      )
+      
+      # Fit linear model
+      fit <- lm(log_a_clean ~ X - 1)  # -1 because X already includes intercept
+      
+      B1 <- coef(fit)[1]
+      B2 <- coef(fit)[2]
+      C <- coef(fit)[3]
+      
+      # Calculate amplitude and phase
+      amplitude <- sqrt(B1^2 + B2^2)
+      
+      # Calculate phase (in days)
+      phase_rad <- atan2(-B2, B1)
+      phase_days <- phase_rad * 365 / (2 * pi)
+      
+      # Ensure phase is between 0 and 365
+      if (phase_days < 0) phase_days <- phase_days + 365
+      
+      # Minimum occurs at phase + 273.75 days
+      minimum_doy <- phase_days + 273.75
+      if (minimum_doy > 365) minimum_doy <- minimum_doy - 365
+      
+      return(list(amplitude = amplitude, minimum_doy = minimum_doy))
+      
+    }, error = function(e) {
+      return(list(amplitude = NA, minimum_doy = NA))
+    })
+  }
+  
+  # Initialize storage for annual metrics
+  years <- unique(streamflow_data$year)
+  annual_metrics <- data.frame(
+    year = years,
+    log_a_pointcloud = NA,
+    log_a_events = NA,
+    b_pointcloud = NA,
+    b_events = NA,
+    concavity = NA
+  )
+  
+  # Store all recession events with their timing
+  all_recession_events <- list()
+  
+  # Process entire dataset to identify all recession events
+  # Sort by year and doy
+  streamflow_data <- streamflow_data[order(streamflow_data$year, streamflow_data$doy), ]
+  
+  # Process each year
+  for (yr in years) {
+    year_data <- streamflow_data[streamflow_data$year == yr, ]
+    
+    # Sort by day of year
+    year_data <- year_data[order(year_data$doy), ]
+    
+    # Identify recession events
+    recession_events <- identify_recession_events(year_data$Q)
+    
+    # Collect all recession data for point cloud analysis
+    all_Q <- numeric()
+    all_dQ_dt <- numeric()
+    
+    # Store individual event parameters
+    event_log_a_values <- numeric()
+    event_b_values <- numeric()
+    event_concavities <- numeric()
+    
+    # Process each recession event
+    for (event in recession_events) {
+      Q_event <- year_data$Q[event$indices]
+      
+      # Get the middle day of the recession event for timing
+      mid_idx <- event$indices[ceiling(length(event$indices)/2)]
+      event_doy <- year_data$doy[mid_idx]
+      
+      # Fit parameters for this event
+      event_params <- fit_recession_event(Q_event, remove_first_day = TRUE)
+      
+      if (!is.na(event_params$log_a) && !is.na(event_params$b)) {
+        event_log_a_values <- c(event_log_a_values, event_params$log_a)
+        event_b_values <- c(event_b_values, event_params$b)
+        
+        # Store event with its timing
+        all_recession_events[[length(all_recession_events) + 1]] <- list(
+          year = yr,
+          doy = event_doy,
+          log_a = event_params$log_a,
+          b = event_params$b
+        )
+        
+        # Calculate concavity (difference in b between first and second half)
+        if (length(Q_event) >= 6) {  # Need at least 6 points
+          mid_point <- floor(length(Q_event) / 2)
+          first_half <- Q_event[1:mid_point]
+          second_half <- Q_event[mid_point:length(Q_event)]
+          
+          params_first <- fit_recession_event(first_half, remove_first_day = FALSE)
+          params_second <- fit_recession_event(second_half, remove_first_day = FALSE)
+          
+          if (!is.na(params_first$b) && !is.na(params_second$b)) {
+            concavity <- params_second$b - params_first$b
+            event_concavities <- c(event_concavities, concavity)
+          }
+        }
+        
+        # Add to point cloud data (removing first day)
+        if (length(Q_event) > 1) {
+          Q_subset <- Q_event[-1]
+          dQ_subset <- -diff(Q_event[-1])
+          
+          valid_idx <- which(Q_subset[-length(Q_subset)] > 0 & dQ_subset > 0)
+          if (length(valid_idx) > 0) {
+            all_Q <- c(all_Q, Q_subset[-length(Q_subset)][valid_idx])
+            all_dQ_dt <- c(all_dQ_dt, dQ_subset[valid_idx])
+          }
+        }
+      }
+    }
+    
+
+    # Calculate median b for use in calculating log(a)
+    median_b <- median(event_b_values, na.rm = TRUE)
+    
+    # Point cloud analysis
+    if (length(all_Q) > 10) {
+      tryCatch({
+        # Fit b using point cloud
+        pc_fit <- lm(log(all_dQ_dt) ~ log(all_Q))
+        b_pointcloud <- coef(pc_fit)[2]
+        
+        # Calculate log(a) using median b
+        # For each point: log(a) = log(-dQ/dt) - b*log(Q)
+        log_a_values_pc <- log(all_dQ_dt) - median_b * log(all_Q)
+        log_a_pointcloud <- median(log_a_values_pc, na.rm = TRUE)
+        
+        annual_metrics$b_pointcloud[annual_metrics$year == yr] <- b_pointcloud
+        annual_metrics$log_a_pointcloud[annual_metrics$year == yr] <- log_a_pointcloud
+      }, error = function(e) {
+        # Leave as NA
+      })
+    }
+    
+    # Individual events analysis
+    if (length(event_log_a_values) > 0) {
+      # Calculate log(a) for events using median b
+      log_a_events_recalc <- numeric()
+      for (i in 1:length(recession_events)) {
+        if (i <= length(event_b_values) && !is.na(event_b_values[i])) {
+          event <- recession_events[[i]]
+          Q_event <- year_data$Q[event$indices]
+          if (length(Q_event) > 1) {
+            Q_subset <- Q_event[-1]  # Remove first day
+            dQ_subset <- -diff(Q_event[-1])
+            valid_idx <- which(Q_subset[-length(Q_subset)] > 0 & dQ_subset > 0)
+            if (length(valid_idx) > 0) {
+              log_a_vals <- log(dQ_subset[valid_idx]) - median_b * log(Q_subset[-length(Q_subset)][valid_idx])
+              log_a_events_recalc <- c(log_a_events_recalc, median(log_a_vals, na.rm = TRUE))
+            }
+          }
+        }
+      }
+      
+      if (length(log_a_events_recalc) > 0) {
+        annual_metrics$log_a_events[annual_metrics$year == yr] <- median(log_a_events_recalc, na.rm = TRUE)
+      }
+      
+      annual_metrics$b_events[annual_metrics$year == yr] <- median(event_b_values, na.rm = TRUE)
+    }
+    
+    # Concavity
+    if (length(event_concavities) > 0) {
+      annual_metrics$concavity[annual_metrics$year == yr] <- mean(event_concavities, na.rm = TRUE)
+    }
+  }
+  
+  # Check if we have enough data overall
+  total_valid_years <- sum(!is.na(annual_metrics$b_events))
+  if (total_valid_years < 3) {
+    # Not enough data, return all NAs
+    return(result)
+  }
+  
+  # Calculate trends for each signature with stats
+  for (sig in signatures_with_stats) {
+    valid_data <- annual_metrics[!is.na(annual_metrics[[sig]]), ]
+    
+    if (nrow(valid_data) >= 3) {
+      # Theil-Sen slope
+      formula <- as.formula(paste(sig, "~ year"))
+      sen_mod <- try(zyp::zyp.sen(formula, data=valid_data), silent=TRUE)
+      if (!inherits(sen_mod, "try-error")) {
+        result[[paste0(sig, "_slp")]] <- sen_mod$coeff[2]
+      }
+      
+      # Spearman correlation
+      spearmans <- try(cor.test(valid_data$year, valid_data[[sig]], method="spearman"), silent=TRUE)
+      if (!inherits(spearmans, "try-error")) {
+        result[[paste0(sig, "_rho")]] <- spearmans$estimate
+        result[[paste0(sig, "_pval")]] <- spearmans$p.value
+      }
+      
+      # Mean and median
+      result[[paste0(sig, "_mean")]] <- mean(valid_data[[sig]], na.rm=TRUE)
+      result[[paste0(sig, "_median")]] <- median(valid_data[[sig]], na.rm=TRUE)
+    }
+  }
+  
+  # Calculate seasonality of recession parameter log(a)
+  if (length(all_recession_events) >= 10) {
+    # Extract DOY and log(a) values from all events
+    event_doys <- sapply(all_recession_events, function(x) x$doy)
+    event_log_a_values <- sapply(all_recession_events, function(x) x$log_a)
+    event_years <- sapply(all_recession_events, function(x) x$year)
+    
+    # Fit sinusoidal model to all data
+    seasonality_all <- fit_sinusoidal_model(event_doys, event_log_a_values)
+    result$log_a_seasonality_amplitude_all <- seasonality_all$amplitude
+    result$log_a_seasonality_minimum_all <- seasonality_all$minimum_doy
+    
+    # Split into first and last half of years
+    median_year <- median(unique(event_years))
+    first_half_idx <- which(event_years <= median_year)
+    last_half_idx <- which(event_years > median_year)
+    
+    # Fit sinusoidal model to first half
+    if (length(first_half_idx) >= 10) {
+      seasonality_first <- fit_sinusoidal_model(event_doys[first_half_idx], 
+                                                event_log_a_values[first_half_idx])
+      result$log_a_seasonality_amplitude_first_half <- seasonality_first$amplitude
+      result$log_a_seasonality_minimum_first_half <- seasonality_first$minimum_doy
+    }
+    
+    # Fit sinusoidal model to last half
+    if (length(last_half_idx) >= 10) {
+      seasonality_last <- fit_sinusoidal_model(event_doys[last_half_idx], 
+                                               event_log_a_values[last_half_idx])
+      result$log_a_seasonality_amplitude_last_half <- seasonality_last$amplitude
+      result$log_a_seasonality_minimum_last_half <- seasonality_last$minimum_doy
+    }
+  }
+  
+  # Add annual_metrics as an attribute
+  attr(result, "recession_metrics_by_year") <- annual_metrics
+  attr(result, "recession_events") <- all_recession_events
   
   return(result)
 }
@@ -1428,6 +2413,8 @@ process_caravan_gages <- function(data_project_arg, caravan_base_dir,
       metrics_flow_timing <- analyze_flow_timing_trends(streamflow_data_filtered)
       metrics_pulses <- calculate_pulse_metrics(streamflow_data_filtered)
       metrics_QtoPPT <- analyze_Q_PPT_relationships(streamflow_data_filtered)
+      metrics_baseflow <- analyze_baseflow_indices(streamflow_data_filtered)
+      metrics_recession <- analyze_recession_parameters(streamflow_data_filtered)
       # Add other metric calculations here if needed
       
       # Create a row for this watershed
@@ -1450,7 +2437,9 @@ process_caravan_gages <- function(data_project_arg, caravan_base_dir,
                              as.data.table(metrics_flashiness),
                              as.data.table(metrics_flow_timing),
                              as.data.table(metrics_pulses),
-                             as.data.table(metrics_QtoPPT))
+                             as.data.table(metrics_QtoPPT),
+                             as.data.table(metrics_baseflow),
+                             as.data.table(metrics_recession))
       
       summary_output <- rbind(summary_output, watershed_row, fill = TRUE)
       fwrite(summary_output, output_file) # Write after each successful processing

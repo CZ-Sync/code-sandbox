@@ -8,6 +8,9 @@
 # Last updated: 4-MAR-2025
 ################################################################################################
 
+# Set the main directory where data and results will be stored
+main_dir = "C:\\Users\\18033\\Documents\\GitHub\\SurfaceWaterProjections\\streamflowSignatures"#"C:/Users/arikt/Documents/GitHub/SurfaceWaterProjections/streamflowSignatures"
+metadata_dir = "D:/"
 # Load helper functions
 source(file.path(main_dir, "helperFunctions.R"), local=FALSE)
 
@@ -15,8 +18,6 @@ source(file.path(main_dir, "helperFunctions.R"), local=FALSE)
 # USER CONFIGURATION - MODIFY THESE SETTINGS AS NEEDED
 ################################################################################################
 
-# Set the main directory where data and results will be stored
-main_dir = "C:/Users/arik/Documents/GitHub/SurfaceWaterProjections/streamflowSignatures"
 
 # Analysis period
 start_date = as.Date("1973-01-01")  # Modern data period
@@ -28,7 +29,7 @@ min_nona_days = 250   # Minimum number of non-NA days per year
 min_Q_value_and_days = c(0.0001, 30)  # Min flow value (mm) and days above this value
 
 # Output file for results
-output_file = file.path(main_dir, "summary_data.csv")
+output_file = file.path(metadata_dir, "processedOuts/summary_data.csv")
 
 ################################################################################################
 # LOAD REQUIRED DATASETS
@@ -42,10 +43,10 @@ if (!dir.exists(file.path(main_dir, "metadata"))) {
 
 # Load USGS CONUS reference gages
 tryCatch({
-  conus_gages_raw = fread(file.path(main_dir, "metadata", "conterm_bas_classif.txt"),
+  conus_gages_raw = fread(file.path(metadata_dir, "gagesMetadata", "conterm_bas_classif.txt"),
                            colClasses = c("STAID" = "character", "AGGECOREGION" = "character")
   )[CLASS=="Ref"]
-  conus_basinid = fread(file.path(main_dir, "metadata", "conterm_basinid.txt"), 
+  conus_basinid = fread(file.path(metadata_dir, "gagesMetadata", "conterm_basinid.txt"), 
                          colClasses = c("STAID" = "character"))
   conus_gages = merge(conus_gages_raw, conus_basinid, by="STAID", all.x=TRUE)
   cat("Loaded", nrow(conus_gages), "CONUS reference gages\n")
@@ -55,10 +56,10 @@ tryCatch({
 
 # Load USGS Alaska reference gages
 tryCatch({
-  AK_gages_all = fread(file.path(main_dir, "metadata", "AKHIPR_bas_classif.txt"),
+  AK_gages_all = fread(file.path(metadata_dir, "gagesMetadata", "AKHIPR_bas_classif.txt"),
                         colClasses = c("STAID" = "character", "AGGECOREGION" = "character")
   )[AGGECOREGION == 'Alaska' & CLASS == 'Ref']
-  AK_basinid = fread(file.path(main_dir, "metadata", "AKHIPR_basinid.txt"), 
+  AK_basinid = fread(file.path(metadata_dir, "gagesMetadata", "AKHIPR_basinid.txt"), 
                       colClasses = c("STAID" = "character"))
   AK_gages = merge(AK_gages_all, AK_basinid, by="STAID", all.x=TRUE)
   cat("Loaded", nrow(AK_gages), "Alaska reference gages\n")
@@ -68,7 +69,7 @@ tryCatch({
 
 # Load Canadian reference gages
 tryCatch({
-  canadian_gages_goodData = fread(file.path(main_dir, "metadata", "Canadian_gages_goodones.csv"))
+  canadian_gages_goodData = fread(file.path(metadata_dir, "gagesMetadata", "Canadian_gages_goodones.csv"))
   regulation_info = as.data.table(hy_stn_regulation(canadian_gages_goodData$STATION_NUMBER))
   canadian_gages = merge(canadian_gages_goodData, regulation_info, 
                           by = "STATION_NUMBER", all.x = TRUE)[REGULATED != TRUE]
@@ -80,7 +81,7 @@ tryCatch({
 
 # Load watershed boundaries (HydroBASINS)
 tryCatch({
-  basinAt_NorAm_polys = st_read(file.path(main_dir, "basinAt_NorAm_polys.gpkg"))
+  basinAt_NorAm_polys = st_read(file.path(metadata_dir, "geospatial_derivedData/basinAt_NorAm_polys.gpkg"))
   basinAt_NorAm_strip = basinAt_NorAm_polys
   st_geometry(basinAt_NorAm_strip) = NULL
   HB_dt = data.table(basinAt_NorAm_strip)
@@ -91,7 +92,7 @@ tryCatch({
 })
 
 # Load or initialize upstream hydrobasins cache
-upstream_hydrobasins_file = file.path(main_dir, "upstream_hydrobasins.RData")
+upstream_hydrobasins_file = file.path(metadata_dir, "geospatial_derivedData/upstream_hydrobasins.RData")
 if (file.exists(upstream_hydrobasins_file)) {
   upstream_hydrobasins = readRDS(upstream_hydrobasins_file)
   cat("Loaded cached upstream basin relationships\n")
@@ -113,7 +114,7 @@ if (!dir.exists(output_dir)) {
 
 # Process USGS Alaska gages
 cat("\n========== PROCESSING ALASKA GAGES ==========\n")
-summary_output = process_gages(
+summary_output = process_gages_rawData(
   gages_df = AK_gages,
   gage_type = "USGS",
   min_num_years = min_num_years,
@@ -128,7 +129,7 @@ summary_output = process_gages(
 
 # Process USGS CONUS gages
 cat("\n========== PROCESSING CONUS GAGES ==========\n")
-summary_output = process_gages(
+summary_output = process_gages_rawData(
   gages_df = conus_gages,
   gage_type = "USGS",
   min_num_years = min_num_years,
@@ -143,7 +144,7 @@ summary_output = process_gages(
 
 # Process Canadian gages
 cat("\n========== PROCESSING CANADIAN GAGES ==========\n")
-summary_output = process_gages(
+summary_output = process_gages_rawData(
   gages_df = canadian_gages,
   gage_type = "Canada",  
   min_num_years = min_num_years,
